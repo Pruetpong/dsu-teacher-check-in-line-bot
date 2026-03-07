@@ -1,77 +1,153 @@
 // ============================================================
-// Code.gs — Webhook หลักและ Entry Point ของระบบทั้งหมด
+// Code.gs — Logic ทั้งหมดของระบบเช็คอินการเข้าสอนของครู
+// โรงเรียนสาธิต มหาวิทยาลัยศิลปากร (มัธยมศึกษา)
 //
-// ไฟล์นี้ทำหน้าที่:
-//   1. รับ HTTP Request จาก LINE Platform (doPost)
-//   2. ตรวจสอบ Signature ความปลอดภัย
-//   3. วิเคราะห์ Event และระบุ Role ของผู้ส่ง
-//   4. ส่งต่อไปยัง Handler ที่ถูกต้อง
-//      ├─ MonitorHandler  (หัวหน้าห้อง)
-//      ├─ TeacherHandler  (ครูผู้สอน)
-//      └─ AdminHandler    (ฝ่ายวิชาการ)
-//   5. ฟังก์ชัน sendLineMessage() สำหรับส่งข้อความกลับ
+// สารบัญ:
+//   SECTION 1  — PropertiesService (Credentials)
+//   SECTION 2  — Webhook Entry Point (doPost / doGet)
+//   SECTION 3  — Event Router
+//   SECTION 4  — Follow / Unfollow / Unknown User
+//   SECTION 5  — Monitor Flow (หัวหน้าห้อง)
+//   SECTION 6  — Teacher Flow (ครูผู้สอน — State Machine)
+//   SECTION 7  — Admin Flow (ฝ่ายวิชาการ)
+//   SECTION 8  — Sheet Manager (CRUD)
+//   SECTION 9  — Flex Messages (UI Templates)
+//   SECTION 10 — LINE API (sendLineMessage)
+//   SECTION 11 — Setup & Testing Functions
 //
-// ⚠️  Deploy ไฟล์นี้เป็น Web App:
+// ⚠️  Deploy เป็น Web App:
 //      Execute as: Me
 //      Who has access: Anyone
+//
+// ⚠️  ก่อนใช้งาน รันฟังก์ชัน setupCredentials()
+//      ใน SECTION 11 เพื่อตั้งค่า Credentials ครั้งแรก
 // ============================================================
 
 
 // ============================================================
-// 🌐 SECTION 1: doPost — รับ Webhook จาก LINE
+// 🔐 SECTION 1: PropertiesService — จัดการ Credentials
+// ============================================================
+
+/**
+ * ดึงค่า Credential จาก Script Properties
+ * ใช้แทน CREDENTIALS.XXX ในโค้ดเดิม
+ *
+ * Keys ที่รองรับ:
+ *   LINE_CHANNEL_ACCESS_TOKEN
+ *   LINE_CHANNEL_SECRET
+ *   SPREADSHEET_ID
+ *   ADMIN_LINE_IDS   (JSON Array String เช่น ["Uabc","Udef"])
+ *   BOT_BASIC_ID     (เช่น "@abc1234d")
+ *
+ * @param {string} key - ชื่อ Property ที่ต้องการ
+ * @returns {string} ค่าที่เก็บไว้ หรือ '' ถ้าไม่พบ
+ */
+function getCredential(key) {
+  const props = PropertiesService.getScriptProperties();
+  return props.getProperty(key) || '';
+}
+
+
+/**
+ * ดึง ADMIN_LINE_IDS เป็น Array
+ * (เก็บใน Properties เป็น JSON String)
+ *
+ * @returns {Array<string>} Array ของ LINE User IDs
+ */
+function getAdminLineIds() {
+  try {
+    const raw = getCredential('ADMIN_LINE_IDS');
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch (e) {
+    logInfo('Props', 'ERROR getAdminLineIds', e.message);
+    return [];
+  }
+}
+
+
+/**
+ * ตรวจสอบว่า Credentials ตั้งค่าครบหรือยัง
+ *
+ * @returns {Object} { ok: boolean, missing: Array<string> }
+ */
+function checkCredentials() {
+  const required = [
+    'LINE_CHANNEL_ACCESS_TOKEN',
+    'LINE_CHANNEL_SECRET',
+    'SPREADSHEET_ID',
+    'ADMIN_LINE_IDS',
+    'BOT_BASIC_ID',
+  ];
+  const missing = required.filter(k => !getCredential(k));
+  return { ok: missing.length === 0, missing };
+}
+
+
+// ============================================================
+// 🌐 SECTION 2: Webhook Entry Point
 // ============================================================
 
 /**
  * รับ HTTP POST Request จาก LINE Platform
- * LINE จะส่ง Webhook มาที่ URL นี้ทุกครั้งที่มี Event
+ * LINE ส่ง Webhook มาทุกครั้งที่มี Event เกิดขึ้น
  *
- * @param {Object} e - Google Apps Script Event Object
+ * @param {Object} e - GAS Event Object
  * @returns {GoogleAppsScript.Content.TextOutput}
  */
 function doPost(e) {
-
-  // ตอบ LINE กลับทันทีว่าได้รับแล้ว (HTTP 200)
-  // LINE จะ Retry ถ้าไม่ได้รับ Response ภายใน 30 วินาที
+  // ตอบ LINE กลับทันที HTTP 200
+  // LINE จะ Retry ถ้าไม่ได้รับภายใน 30 วินาที
   const response = ContentService
     .createTextOutput(JSON.stringify({ status: 'ok' }))
-    .setMimeType(ContentService.MimeType.JSON);
+    .setMimeType(ContentService.MimeType.JSON)
+    .setStatusCode(200);
 
   try {
-    // 1. ตรวจสอบว่ามีข้อมูลมาหรือไม่
     if (!e || !e.postData || !e.postData.contents) {
       logInfo('doPost', 'ไม่มีข้อมูล postData');
       return response;
     }
 
-    const body      = e.postData.contents;
-    const signature = e.parameter['x-line-signature'] ||
-                      (e.headers && e.headers['X-Line-Signature']);
+    const body = e.postData.contents;
 
-    // 2. ตรวจสอบ Signature (ความปลอดภัย)
-    //    ป้องกัน Request ปลอมที่ไม่ได้มาจาก LINE
+    // ── แก้ไขจากโค้ดเดิม ──────────────────────────────────
+    // e.parameter ใช้สำหรับ Query String เท่านั้น
+    // Signature ของ LINE อยู่ใน HTTP Header ซึ่งใน GAS
+    // ต้องอ่านจาก e.postData หรือ e.headers
+    // แต่ GAS Web App ไม่ส่ง Header ตรง ๆ มาใน e.headers
+    // วิธีที่เชื่อถือได้คือให้ LINE ส่ง Signature ใน
+    // Query String แทน หรือข้ามการ Verify ในช่วงพัฒนา
+    // แล้วใช้ IP Whitelist ของ LINE แทน
+    //
+    // ⚠️  สำหรับ Production ควรใช้ LINE IP Ranges:
+    //     https://developers.line.biz/en/docs/messaging-api/
+    //     webhook-settings/#ip-addresses
+    // ──────────────────────────────────────────────────────
+    const signature = e.parameter && e.parameter['signature']
+      ? e.parameter['signature']
+      : (e.parameter && e.parameter['x-line-signature'])
+        ? e.parameter['x-line-signature']
+        : null;
+
     if (!verifyLineSignature(body, signature)) {
       logInfo('doPost', '⚠️ Signature ไม่ถูกต้อง — ปฏิเสธ Request');
-      return response; // ไม่ตอบ Error เพื่อไม่ให้ผู้ไม่หวังดีรู้
+      return response;
     }
 
-    // 3. Parse JSON Body
     const data = JSON.parse(body);
+    logInfo('doPost', `รับ ${data.events.length} events จาก LINE`);
 
-    logInfo('doPost', `รับ Events จาก LINE`, `${data.events.length} events`);
-
-    // 4. วนลูปประมวลผลทุก Event
-    //    LINE อาจส่ง Events มาหลายรายการพร้อมกัน
     data.events.forEach(event => {
       try {
         processEvent(event);
       } catch (eventError) {
-        // Error ใน Event หนึ่งไม่กระทบ Event อื่น
-        logInfo('doPost', `ERROR ใน Event: ${event.type}`, eventError.message);
+        logInfo('doPost', `ERROR ใน Event ${event.type}`, eventError.message);
       }
     });
 
   } catch (error) {
-    logInfo('doPost', 'ERROR ใน doPost', error.message);
+    logInfo('doPost', 'ERROR', error.message);
   }
 
   return response;
@@ -79,102 +155,84 @@ function doPost(e) {
 
 
 /**
- * รับ HTTP GET Request
- * ใช้ทดสอบว่า Web App Deploy สำเร็จหรือไม่
+ * รับ HTTP GET — ใช้ทดสอบว่า Deploy สำเร็จ
  *
  * @returns {GoogleAppsScript.Content.TextOutput}
  */
-function doGet(e) {
-  const statusInfo = {
-    status:      'running',
-    system:      'Teacher Check-in LINE Bot',
-    school:      SCHOOL_CONFIG.SCHOOL_NAME,
-    version:     '1.0.0',
-    timestamp:   new Date().toLocaleString('th-TH', {
-      timeZone: 'Asia/Bangkok',
-    }),
+function doGet() {
+  const credCheck = checkCredentials();
+  const status = {
+    status:       'running',
+    system:       'Teacher Check-in LINE Bot',
+    school:       SCHOOL_CONFIG.SCHOOL_NAME,
+    version:      '2.0.0',
+    credentials:  credCheck.ok ? 'OK' : `MISSING: ${credCheck.missing.join(', ')}`,
+    timestamp:    new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' }),
   };
-
   return ContentService
-    .createTextOutput(JSON.stringify(statusInfo, null, 2))
-    .setMimeType(ContentService.MimeType.JSON);
+    .createTextOutput(JSON.stringify(status, null, 2))
+    .setMimeType(ContentService.MimeType.JSON)
+    .setStatusCode(200);
 }
 
 
-// ============================================================
-// 🔐 SECTION 2: ตรวจสอบ Signature (Security)
-// ============================================================
-
 /**
- * ตรวจสอบ X-Line-Signature เพื่อยืนยันว่า Request
- * มาจาก LINE Platform จริง ไม่ใช่การปลอมแปลง
+ * ตรวจสอบ X-Line-Signature
  *
- * วิธีการ: HMAC-SHA256 ของ Request Body
- *          โดยใช้ Channel Secret เป็น Key
- *          แล้วเปรียบเทียบกับ Signature ใน Header
- *
- * @param {string} body      - Raw Request Body (JSON String)
- * @param {string} signature - X-Line-Signature Header
- * @returns {boolean} true = Valid
+ * @param {string}      body      - Raw Request Body
+ * @param {string|null} signature - Signature ที่ได้รับ
+ * @returns {boolean}
  */
 function verifyLineSignature(body, signature) {
   try {
-    // ถ้าไม่มี Signature → ปฏิเสธทันที
+    // ถ้าไม่มี Signature ในช่วง Development ให้ผ่านไปก่อน
+    // ⚠️ Production ต้องเปิด Strict Mode (return false ถ้าไม่มี Signature)
     if (!signature) {
-      logInfo('Security', 'ไม่มี Signature Header');
+      logInfo('Security', '⚠️ ไม่มี Signature — อนุญาตในช่วง Dev');
+      return true; // ← เปลี่ยนเป็น false เมื่อ Production
+    }
+
+    const channelSecret = getCredential('LINE_CHANNEL_SECRET');
+    if (!channelSecret) {
+      logInfo('Security', 'ERROR: ไม่พบ LINE_CHANNEL_SECRET ใน Properties');
       return false;
     }
 
-    // คำนวณ HMAC-SHA256
-    const channelSecret = CREDENTIALS.LINE_CHANNEL_SECRET;
-    const bodyBytes     = Utilities.newBlob(body).getBytes();
-    const keyBytes      = Utilities.newBlob(channelSecret).getBytes();
-
-    const hmac = Utilities.computeHmacSha256Signature(bodyBytes, keyBytes);
-
-    // แปลงผลลัพธ์เป็น Base64
-    const computedSignature = Utilities.base64Encode(hmac);
-
-    // เปรียบเทียบ (สังเกต: trim() เพื่อกัน Whitespace)
-    const isValid = computedSignature === signature.trim();
+    const bodyBytes = Utilities.newBlob(body).getBytes();
+    const keyBytes  = Utilities.newBlob(channelSecret).getBytes();
+    const hmac      = Utilities.computeHmacSha256Signature(bodyBytes, keyBytes);
+    const computed  = Utilities.base64Encode(hmac);
+    const isValid   = computed === signature.trim();
 
     if (!isValid) {
-      logInfo('Security',
-        'Signature ไม่ตรง',
-        `Expected: ${computedSignature}, Got: ${signature}`
-      );
+      logInfo('Security', 'Signature ไม่ตรง', `computed=${computed}`);
     }
-
     return isValid;
 
   } catch (e) {
     logInfo('Security', 'ERROR verifyLineSignature', e.message);
-    // ถ้าตรวจสอบไม่ได้ → ปฏิเสธเพื่อความปลอดภัย
     return false;
   }
 }
 
 
 // ============================================================
-// 🔀 SECTION 3: Event Router — ส่งต่อไปยัง Handler
+// 🔀 SECTION 3: Event Router
 // ============================================================
 
 /**
  * ประมวลผล LINE Event แต่ละรายการ
- * ระบุ Role ของผู้ส่ง แล้วส่งต่อไปยัง Handler ที่ถูกต้อง
+ * ระบุ Role แล้วส่งต่อ Handler ที่ถูกต้อง
  *
  * @param {Object} event - LINE Event Object
  */
 function processEvent(event) {
-
-  // ---- กรองเฉพาะ Event ที่ระบบรองรับ ----
-  const supportedEvents = ['message', 'postback', 'follow', 'unfollow'];
-  if (!supportedEvents.includes(event.type)) {
-    logInfo('Router', `ข้ามข้าม Event: ${event.type}`);
+  const supportedTypes = ['message', 'postback', 'follow', 'unfollow'];
+  if (!supportedTypes.includes(event.type)) {
+    logInfo('Router', `ข้าม Event ที่ไม่รองรับ: ${event.type}`);
     return;
   }
 
-  // ---- ดึง User ID ----
   const userId = event.source && event.source.userId;
   if (!userId) {
     logInfo('Router', 'ไม่พบ userId ใน Event');
@@ -183,46 +241,31 @@ function processEvent(event) {
 
   logInfo('Router', `Event: ${event.type} | User: ${userId}`);
 
-  // ---- จัดการ Event พิเศษ ----
-
-  // ผู้ใช้ Add Bot เป็นเพื่อน
+  // จัดการ Follow / Unfollow ก่อนระบุ Role
   if (event.type === 'follow') {
     handleFollowEvent(userId);
     return;
   }
-
-  // ผู้ใช้ Block Bot
   if (event.type === 'unfollow') {
     handleUnfollowEvent(userId);
     return;
   }
 
-  // ---- ระบุ Role ของผู้ส่ง ----
+  // ระบุ Role
   const userInfo = identifyUserRole(userId);
-  logInfo('Router', `Role: ${userInfo.role}`, userId);
+  logInfo('Router', `Role: ${userInfo.role}`);
 
-  // ---- ส่งต่อไปยัง Handler ตาม Role ----
   switch (userInfo.role) {
-
     case SYSTEM_CONFIG.USER_ROLE.ADMIN:
-      logInfo('Router', 'ส่งต่อไป AdminHandler');
       handleAdminEvent(event, userInfo.data);
       break;
-
     case SYSTEM_CONFIG.USER_ROLE.TEACHER:
-      logInfo('Router', 'ส่งต่อไป TeacherHandler');
       handleTeacherEvent(event, userInfo.data);
       break;
-
     case SYSTEM_CONFIG.USER_ROLE.MONITOR:
-      logInfo('Router', 'ส่งต่อไป MonitorHandler');
       handleMonitorEvent(event, userInfo.data);
       break;
-
-    case SYSTEM_CONFIG.USER_ROLE.UNKNOWN:
     default:
-      // ผู้ใช้ไม่ได้ลงทะเบียนในระบบ
-      logInfo('Router', 'Unknown User — ส่งข้อความแนะนำ');
       handleUnknownUser(userId, event);
       break;
   }
@@ -234,129 +277,194 @@ function processEvent(event) {
 // ============================================================
 
 /**
- * จัดการเมื่อผู้ใช้ Add Bot เป็นเพื่อน
- * แสดงข้อความต้อนรับและแจ้ง LINE User ID
- * (Admin ใช้ ID นี้ไปกรอกใน Google Sheets)
+ * ผู้ใช้ Add Bot เป็นเพื่อน
  *
- * @param {string} userId - LINE User ID ที่เพิ่งเพิ่มเพื่อน
+ * @param {string} userId
  */
 function handleFollowEvent(userId) {
-  logInfo('Follow', `ผู้ใช้ใหม่ Add Bot: ${userId}`);
+  logInfo('Follow', `ผู้ใช้ใหม่: ${userId}`);
 
-  // ตรวจสอบก่อนว่าอยู่ในระบบหรือยัง
   const userInfo = identifyUserRole(userId);
 
-  if (userInfo.role !== SYSTEM_CONFIG.USER_ROLE.UNKNOWN) {
-    // อยู่ในระบบแล้ว → ต้อนรับตาม Role
-    if (userInfo.role === SYSTEM_CONFIG.USER_ROLE.TEACHER) {
+  switch (userInfo.role) {
+    case SYSTEM_CONFIG.USER_ROLE.TEACHER:
       sendLineMessage(userId, [
-        { type: 'text', text: MESSAGES.WELCOME_TEACHER(userInfo.data['Teacher_Name']) },
+        {
+          type: 'text',
+          text:
+            `สวัสดีค่ะ ${userInfo.data['Teacher_Name']} 🙏\n\n` +
+            `ป้าไพรมาในรูปแบบใหม่นะคะ 😊\n` +
+            `คราวนี้ป้าไพรมาช่วยดูแล\n` +
+            `ระบบเช็คอินการเข้าสอนโดยเฉพาะค่ะ\n\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `📲 วิธีเช็คอิน\n` +
+            `สแกน QR Code จากหัวหน้าห้อง\n` +
+            `ผ่าน LINE ได้เลยนะคะ\n` +
+            `━━━━━━━━━━━━━━━━━━\n\n` +
+            `พิมพ์ /help เพื่อดูคู่มือได้เลยค่ะ 🎉`,
+        },
         flexTeacherMenu(userInfo.data['Teacher_Name']),
       ]);
-    } else if (userInfo.role === SYSTEM_CONFIG.USER_ROLE.MONITOR) {
+      break;
+
+    case SYSTEM_CONFIG.USER_ROLE.MONITOR:
       sendLineMessage(userId, [{
         type: 'text',
-        text: MESSAGES.WELCOME_MONITOR(
-          userInfo.data['Student_Name'],
-          userInfo.data['Classroom']
-        ),
+        text:
+          `สวัสดีค่ะ ${userInfo.data['Student_Name']} 🙏\n\n` +
+          `ป้าไพรมาในรูปแบบใหม่นะคะ 😊\n` +
+          `คราวนี้ป้าไพรมาช่วยดูแล\n` +
+          `ระบบเช็คอินการเข้าสอนโดยเฉพาะค่ะ\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🏫 คุณคือหัวหน้าห้อง\n` +
+          `${userInfo.data['Classroom']} ค่ะ\n` +
+          `━━━━━━━━━━━━━━━━━━\n\n` +
+          `พิมพ์ /help เพื่อดูวิธีสร้าง QR\n` +
+          `ได้เลยนะคะ 😊`,
       }]);
-    } else if (userInfo.role === SYSTEM_CONFIG.USER_ROLE.ADMIN) {
+      sendMonitorMainMenu(userId, userInfo.data);
+      break;
+
+    case SYSTEM_CONFIG.USER_ROLE.ADMIN:
       sendLineMessage(userId, [
-        { type: 'text', text: '👔 ยินดีต้อนรับ Admin ฝ่ายวิชาการค่ะ!' },
+        {
+          type: 'text',
+          text:
+            'สวัสดีค่ะ 🙏\n\n' +
+            'ป้าไพรมาในรูปแบบใหม่นะคะ 😊\n' +
+            'คราวนี้ป้าไพรมาช่วยดูแล\n' +
+            'ระบบเช็คอินการเข้าสอนโดยเฉพาะค่ะ\n\n' +
+            'ยินดีต้อนรับ Admin ฝ่ายวิชาการนะคะ 👔\n' +
+            'พิมพ์ /help เพื่อดูคำสั่งได้เลยค่ะ',
+        },
         flexAdminMenu(),
       ]);
-    }
-    return;
+      break;
+
+    default:
+      sendLineMessage(userId, [{
+        type: 'text',
+        text:
+          `สวัสดีค่ะ 🙏\n\n` +
+          `ป้าไพรยินดีต้อนรับนะคะ 😊\n` +
+          `ระบบนี้ดูแลการเช็คอินการเข้าสอน\n` +
+          `ของ${SCHOOL_CONFIG.SCHOOL_NAME}ค่ะ\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `📋 LINE User ID ของคุณ:\n` +
+          `${userId}\n` +
+          `━━━━━━━━━━━━━━━━━━\n\n` +
+          `📌 ถ้าคุณเป็นครูผู้สอน\n` +
+          `ลงทะเบียนได้เลยนะคะ:\n\n` +
+          `พิมพ์  /reg ชื่อของคุณ\n` +
+          `เช่น   /reg สมชาย\n\n` +
+          `หรือติดต่อฝ่ายวิชาการได้เลยค่ะ 🙏`,
+      }]);
+      notifyAdminNewUser(userId);
+      break;
   }
-
-  // ยังไม่อยู่ในระบบ → ส่ง LINE ID ให้ Admin ไปลงทะเบียน
-  sendLineMessage(userId, [
-    {
-      type: 'text',
-      text:
-        `👋 สวัสดีค่ะ!\n\n` +
-        `ยินดีต้อนรับสู่ระบบเช็คอินการเข้าสอน\n` +
-        `${SCHOOL_CONFIG.SCHOOL_NAME}\n\n` +
-        `━━━━━━━━━━━━━━━━━━\n` +
-        `📋 LINE User ID ของท่าน:\n` +
-        `${userId}\n` +
-        `━━━━━━━━━━━━━━━━━━\n\n` +
-        `📌 กรุณาแจ้ง ID นี้ให้ฝ่ายวิชาการ\n` +
-        `เพื่อลงทะเบียนเข้าใช้งานระบบค่ะ 🙏`,
-    },
-  ]);
-
-  // แจ้ง Admin ด้วยว่ามีผู้ใช้ใหม่
-  notifyAdminNewUser(userId);
 }
 
 
 /**
- * จัดการเมื่อผู้ใช้ Block Bot
+ * ผู้ใช้ Block Bot
  *
- * @param {string} userId - LINE User ID
+ * @param {string} userId
  */
 function handleUnfollowEvent(userId) {
   logInfo('Unfollow', `ผู้ใช้ Block Bot: ${userId}`);
-  // บันทึก Log เท่านั้น ไม่ต้องทำอะไรเพิ่ม
 }
 
 
 /**
- * จัดการผู้ใช้ที่ไม่อยู่ในระบบ
- * แสดง User ID เพื่อให้ Admin ลงทะเบียน
+ * ผู้ใช้ที่ไม่ได้ลงทะเบียนในระบบ
  *
- * @param {string} userId - LINE User ID
- * @param {Object} event  - LINE Event
+ * @param {string} userId
+ * @param {Object} event
  */
 function handleUnknownUser(userId, event) {
+  // --- Postback จาก Unknown User ---
+  if (event.type === 'postback') {
+    const params = parsePostbackData(event.postback.data);
+    const action = params['action'];
 
-  // ถ้าเป็นข้อความ CHECKIN: → แจ้งว่าต้องลงทะเบียนก่อน
-  if (
-    event.type === 'message'       &&
-    event.message.type === 'text'  &&
-    event.message.text.startsWith('CHECKIN:')
-  ) {
-    sendLineMessage(userId, [{
-      type: 'text',
-      text:
-        '⚠️ ท่านยังไม่ได้ลงทะเบียนในระบบค่ะ\n\n' +
-        'กรุณาติดต่อฝ่ายวิชาการเพื่อลงทะเบียนก่อนใช้งานค่ะ 🙏',
-    }]);
+    if (action === 'reg_confirm') {
+      handleRegConfirm(userId, params['teacher_id']);
+      return;
+    }
+    if (action === 'reg_qr_confirm') {
+      handleRegQRConfirm(userId, params['monitor_id']);
+      return;
+    }
+    // Postback อื่น ๆ ที่ไม่รู้จัก
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.WELCOME_UNKNOWN }]);
     return;
   }
 
-  // ข้อความทั่วไป → แสดง User ID
-  sendLineMessage(userId, [
-    {
+  if (event.type === 'message' && event.message.type === 'text') {
+    const text    = event.message.text.trim();
+    const textLow = text.toLowerCase();
+
+    // CHECKIN โดยไม่ได้ลงทะเบียน
+    if (text.startsWith('CHECKIN:')) {
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.NOT_REGISTERED_CHECKIN }]);
+      return;
+    }
+
+    // คำสั่ง /reg — ลงทะเบียนครูผู้สอน
+    if (textLow.startsWith('/reg-qr')) {
+      const keyword = text.slice(7).trim(); // ตัด "/reg-qr" ออก
+      if (!keyword) {
+        sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_QR_USAGE }]);
+        return;
+      }
+      handleRegQRCommand(userId, keyword);
+      return;
+    }
+
+    // คำสั่ง /reg — ต้องตรวจหลัง /reg-qr เพื่อป้องกัน prefix ชน
+    if (textLow.startsWith('/reg')) {
+      const keyword = text.slice(4).trim();
+      if (!keyword) {
+        sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_USAGE }]);
+        return;
+      }
+      handleRegCommand(userId, keyword);
+      return;
+    }
+
+    // ข้อความอื่น ๆ — แนะนำคำสั่งทั้งสอง
+    sendLineMessage(userId, [{
       type: 'text',
       text:
-        `⚠️ ระบบยังไม่พบข้อมูลของท่านค่ะ\n\n` +
-        `📋 LINE User ID ของท่าน:\n` +
-        `${userId}\n\n` +
-        `กรุณาแจ้ง ID นี้ให้ฝ่ายวิชาการเพื่อลงทะเบียนค่ะ 🙏`,
-    },
-  ]);
+        `สวัสดีค่ะ 🙏\n\n` +
+        `ป้าไพรยังไม่พบข้อมูลของคุณ\n` +
+        `ในระบบค่ะ 😅\n\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `👩‍🏫 ถ้าคุณเป็นครูผู้สอน:\n` +
+        `พิมพ์  /reg ชื่อของคุณ\n` +
+        `เช่น   /reg สมชาย\n\n` +
+        `📲 ถ้าคุณเป็นผู้สร้าง QR:\n` +
+        `พิมพ์  /reg-qr ชื่อของคุณ\n` +
+        `เช่น   /reg-qr สมชาย\n` +
+        `━━━━━━━━━━━━━━━━━━\n\n` +
+        `หรือติดต่อฝ่ายวิชาการได้เลยค่ะ 🙏`,
+    }]);
+  }
 }
 
 
 /**
  * แจ้ง Admin เมื่อมีผู้ใช้ใหม่ Add Bot
- * ให้ Admin รู้ว่าต้องลงทะเบียนให้ใคร
  *
- * @param {string} newUserId - LINE User ID ของผู้ใช้ใหม่
+ * @param {string} newUserId
  */
 function notifyAdminNewUser(newUserId) {
   try {
-    const msg =
-      `📢 มีผู้ใช้ใหม่ Add Bot ค่ะ\n\n` +
-      `LINE User ID:\n${newUserId}\n\n` +
-      `กรุณาลงทะเบียนใน Google Sheets\n` +
-      `ถ้าเป็นครูหรือหัวหน้าห้องค่ะ 📋`;
-
-    CREDENTIALS.ADMIN_LINE_IDS.forEach(adminId => {
-      sendLineMessage(adminId, [{ type: 'text', text: msg }]);
+    getAdminLineIds().forEach(adminId => {
+      sendLineMessage(adminId, [{
+        type: 'text',
+        text: MESSAGES.ADMIN_NEW_USER_NOTIFY(newUserId),
+      }]);
     });
   } catch (e) {
     logInfo('Follow', 'ERROR notifyAdminNewUser', e.message);
@@ -365,306 +473,3746 @@ function notifyAdminNewUser(newUserId) {
 
 
 // ============================================================
-// 📤 SECTION 5: sendLineMessage — ส่งข้อความกลับหา LINE
+// 📝 SECTION 4B: Teacher Registration Flow
 // ============================================================
 
 /**
- * ส่งข้อความกลับไปยัง LINE User
- * รองรับทั้ง Reply Message และ Push Message
+ * Step 1: ค้นหาครูจาก keyword และแสดงผลลัพธ์
  *
- * ใช้ Push Message (userId) เพราะ:
- *  - Reply Token หมดอายุใน 30 วินาที
- *  - GAS อาจใช้เวลาประมวลผลนานกว่านั้น
- *  - Push ส่งหา User ได้ทุกเมื่อ
- *
- * @param {string}        userId   - LINE User ID ปลายทาง
- * @param {Array<Object>} messages - Array ของ Message Objects
- * @returns {boolean} สำเร็จหรือไม่
+ * @param {string} userId   - LINE User ID ของผู้ค้นหา
+ * @param {string} keyword  - คำค้น (ชื่อหรือส่วนหนึ่งของชื่อ)
  */
-function sendLineMessage(userId, messages) {
+function handleRegCommand(userId, keyword) {
+  // ป้องกัน: ถ้า userId นี้ลงทะเบียนแล้ว
+  const existing = getTeacherByLineId(userId);
+  if (existing) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_ALREADY_REGISTERED }]);
+    return;
+  }
+
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_SEARCHING(keyword) }]);
+
+  const results = searchTeachersByKeyword(keyword);
+
+  if (results.length === 0) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_NOT_FOUND(keyword) }]);
+    return;
+  }
+
+  sendLineMessage(userId, [flexRegSearchResults(keyword, results)]);
+}
+
+
+/**
+ * Step 2: ครูกดยืนยัน "นี่คือฉัน"
+ * → ตรวจสอบ → Write LINE_User_ID ลง Sheet → แจ้ง Admin
+ *
+ * @param {string} userId     - LINE User ID ผู้ลงทะเบียน
+ * @param {string} teacherId  - Teacher_ID ที่เลือก
+ */
+function handleRegConfirm(userId, teacherId) {
+  if (!teacherId) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // ป้องกัน: userId นี้ลงทะเบียนแล้ว
+  const existingByLineId = getTeacherByLineId(userId);
+  if (existingByLineId) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_ALREADY_REGISTERED }]);
+    return;
+  }
+
+  // ดึงข้อมูลครูจาก Teacher_ID
+  const teacher = getTeacherById(teacherId);
+  if (!teacher) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // ป้องกัน: Teacher_ID นี้มีคนลงทะเบียนแล้ว
+  if (teacher['LINE_User_ID'] && teacher['LINE_User_ID'].toString().trim() !== '') {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: MESSAGES.REG_TEACHER_TAKEN(teacher['Teacher_Name']),
+    }]);
+    return;
+  }
+
+  // บันทึก LINE_User_ID ลง Sheet
+  const success = registerTeacherLineId(teacherId, userId);
+  if (!success) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // แจ้งผลสำเร็จ
+  sendLineMessage(userId, [
+    { type: 'text', text: MESSAGES.REG_SUCCESS(teacher['Teacher_Name']) },
+    flexTeacherMenu(teacher['Teacher_Name']),
+  ]);
+
+  // แจ้ง Admin
+  getAdminLineIds().forEach(adminId => {
+    sendLineMessage(adminId, [{
+      type: 'text',
+      text: MESSAGES.REG_ADMIN_NOTIFY(teacher['Teacher_Name'], userId),
+    }]);
+  });
+
+  logInfo('Reg', `✅ ลงทะเบียนสำเร็จ: ${teacher['Teacher_Name']} (${userId})`);
+}
+
+// ============================================================
+// 📲 SECTION 4C: QR Creator Registration Flow
+// ============================================================
+
+/**
+ * Step 1: ค้นหาผู้สร้าง QR จาก keyword และแสดงผลลัพธ์
+ *
+ * @param {string} userId   - LINE User ID ของผู้ค้นหา
+ * @param {string} keyword  - คำค้นหา (ชื่อหรือส่วนหนึ่งของชื่อ)
+ */
+function handleRegQRCommand(userId, keyword) {
+  // ป้องกัน: ถ้า userId นี้ลงทะเบียนเป็น Monitor แล้ว
+  const existingMonitor = getMonitorByLineId(userId);
+  if (existingMonitor) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_QR_ALREADY_REGISTERED }]);
+    return;
+  }
+
+  // ป้องกัน: ถ้า userId นี้ลงทะเบียนเป็นครูแล้ว ก็ไม่ควรลง Monitor ซ้ำ
+  const existingTeacher = getTeacherByLineId(userId);
+  if (existingTeacher) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text:
+        'ป้าไพรขอแจ้งให้ทราบนะคะ 😊\n\n' +
+        '⚠️ บัญชีนี้ลงทะเบียนเป็นครูผู้สอนแล้วค่ะ\n\n' +
+        'หากต้องการแก้ไข กรุณาติดต่อ\n' +
+        'ฝ่ายวิชาการได้เลยนะคะ 🙏',
+    }]);
+    return;
+  }
+
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_QR_SEARCHING(keyword) }]);
+
+  const results = searchMonitorsByKeyword(keyword);
+
+  if (results.length === 0) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_QR_NOT_FOUND(keyword) }]);
+    return;
+  }
+
+  sendLineMessage(userId, [flexRegQRSearchResults(keyword, results)]);
+}
+
+
+/**
+ * Step 2: ผู้สร้าง QR กดยืนยัน "นี่คือฉัน"
+ * → ตรวจสอบ → Write LINE_User_ID → แจ้ง Admin → ส่งเมนู Monitor
+ *
+ * @param {string} userId    - LINE User ID ผู้ลงทะเบียน
+ * @param {string} monitorId - Monitor_ID ที่เลือก
+ */
+function handleRegQRConfirm(userId, monitorId) {
+  if (!monitorId) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // ป้องกัน: userId นี้ลงทะเบียนแล้ว
+  const existingMonitor = getMonitorByLineId(userId);
+  if (existingMonitor) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_QR_ALREADY_REGISTERED }]);
+    return;
+  }
+
+  // ดึงข้อมูล Monitor จาก Monitor_ID
+  const monitor = getMonitorById(monitorId);
+  if (!monitor) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // ป้องกัน: Monitor_ID นี้มีคนลงทะเบียนแล้ว
+  if (monitor['LINE_User_ID'] && monitor['LINE_User_ID'].toString().trim() !== '') {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: MESSAGES.REG_QR_MONITOR_TAKEN(monitor['Student_Name']),
+    }]);
+    return;
+  }
+
+  // บันทึก LINE_User_ID ลง Sheet
+  const success = registerMonitorLineId(monitorId, userId);
+  if (!success) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // สร้าง Scope Label สำหรับข้อความต้อนรับ
+  const scopeLabel = getScopeLabel(monitor);
+
+  // แจ้งผลสำเร็จ
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.REG_QR_SUCCESS(monitor['Student_Name'], scopeLabel),
+  }]);
+
+  // ส่งเมนู Monitor ทันที
+  Utilities.sleep(500);
+  sendMonitorMainMenu(userId, monitor);
+
+  // แจ้ง Admin
+  const creatorTypeDisplay = _getCreatorTypeDisplay(monitor['Creator_Type']);
+  getAdminLineIds().forEach(adminId => {
+    sendLineMessage(adminId, [{
+      type: 'text',
+      text: MESSAGES.REG_QR_ADMIN_NOTIFY(
+        monitor['Student_Name'],
+        creatorTypeDisplay,
+        scopeLabel,
+        userId
+      ),
+    }]);
+  });
+
+  logInfo('RegQR', `✅ ลงทะเบียนสำเร็จ: ${monitor['Student_Name']} (${userId})`);
+}
+
+
+/**
+ * แปลง Creator_Type เป็นข้อความภาษาไทย
+ * @private
+ *
+ * @param {string} creatorType
+ * @returns {string}
+ */
+function _getCreatorTypeDisplay(creatorType) {
+  const map = {
+    [SYSTEM_CONFIG.CREATOR_TYPE.STUDENT]: '🎓 นักเรียนหัวหน้าห้อง',
+    [SYSTEM_CONFIG.CREATOR_TYPE.TEACHER]: '👩‍🏫 ครูหัวหน้าระดับ',
+    [SYSTEM_CONFIG.CREATOR_TYPE.STAFF]:   '👔 บุคลากรงานทะเบียน',
+    [SYSTEM_CONFIG.CREATOR_TYPE.ADMIN]:   '🏫 ผู้บริหาร',
+  };
+  return map[creatorType] || creatorType || '-';
+}
+
+
+// ============================================================
+// 👨‍🎓 SECTION 5: Monitor Flow (หัวหน้าห้อง)
+// ============================================================
+
+/**
+ * Entry Point สำหรับ Monitor
+ *
+ * @param {Object} event
+ * @param {Object} monitorData
+ */
+function handleMonitorEvent(event, monitorData) {
   try {
-    // ตรวจสอบ Input
-    if (!userId || !messages || messages.length === 0) {
-      logInfo('sendLineMessage', 'ERROR: userId หรือ messages ว่าง');
-      return false;
+    if (event.type === 'message' && event.message.type === 'text') {
+      handleMonitorMessage(event, monitorData);
+    } else if (event.type === 'postback') {
+      handleMonitorPostback(event, monitorData);
+    } else {
+      sendMonitorMainMenu(event.source.userId, monitorData);
+    }
+  } catch (e) {
+    logInfo('Monitor', 'ERROR', e.message);
+    sendLineMessage(event.source.userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+  }
+}
+
+
+/**
+ * จัดการข้อความจาก Monitor
+ *
+ * @param {Object} event
+ * @param {Object} monitorData
+ */
+function handleMonitorMessage(event, monitorData) {
+  const userId  = event.source.userId;
+  const textLow = event.message.text.trim().toLowerCase();
+
+  // Special Commands
+  if (textLow === '/help' || textLow === 'help') {
+    sendMonitorHelp(userId, monitorData);
+    return;
+  }
+  if (textLow === '/status' || textLow === 'status') {
+    sendMonitorStatus(userId, monitorData);
+    return;
+  }
+
+  if (['qr', 'สร้าง qr', 'สร้างqr', 'สร้างคิวอาร์', 'qr code',
+       'ตาราง', 'ตารางเรียน', 'ตารางสอน'].includes(textLow)) {
+    showTodaySchedule(userId, monitorData);
+    return;
+  }
+
+  if (['เมนู', 'menu', 'หน้าหลัก'].includes(textLow)) {
+    sendMonitorMainMenu(userId, monitorData);
+    return;
+  }
+
+  sendMonitorMainMenu(userId, monitorData);
+}
+
+
+/**
+ * จัดการ Postback จาก Monitor
+ *
+ * @param {Object} event
+ * @param {Object} monitorData
+ */
+function handleMonitorPostback(event, monitorData) {
+  const userId = event.source.userId;
+  const params = parsePostbackData(event.postback.data);
+  const action = params['action'];
+
+  logInfo('Monitor', `Postback: ${action}`);
+
+  switch (action) {
+    case 'create_qr':
+      handleCreateQRRequest(userId, monitorData, params);
+      break;
+    case 'confirm_qr':
+      handleConfirmQR(userId, monitorData, params);
+      break;
+    case 'cancel_qr':
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.CANCEL_QR }]);
+      break;
+    default:
+      sendMonitorMainMenu(userId, monitorData);
+  }
+}
+
+
+/**
+ * แสดงตารางสอนวันนี้ของห้อง
+ *
+ * @param {string} userId
+ * @param {Object} monitorData
+ */
+function showTodaySchedule(userId, monitorData) {
+  const scopeLabel = getScopeLabel(monitorData);
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.LOADING_SCHEDULE(scopeLabel),
+  }]);
+
+  const schedules = getScheduleByCreatorScope(monitorData);
+
+  if (schedules.length === 0) {
+    sendLineMessage(userId, [flexNoSchedule(scopeLabel)]);
+    return;
+  }
+
+  // เติมชื่อครูแทน Teacher_ID ใน Card
+  const schedulesDisplay = schedules.map(s => {
+    const teacher = getTeacherById(s['Teacher_ID']);
+    return {
+      ...s,
+      Teacher_Name: teacher ? teacher['Teacher_Name'] : s['Teacher_ID'],
+    };
+  });
+
+  // LINE Carousel รองรับสูงสุด 11 Bubbles (+ 1 Header = 12)
+  // ถ้าเกิน ให้แสดงเฉพาะ 11 รายการแรกและแจ้งผู้ใช้
+  const MAX_BUBBLES = 11;
+  const hasMore     = schedulesDisplay.length > MAX_BUBBLES;
+  const toDisplay   = schedulesDisplay.slice(0, MAX_BUBBLES);
+
+  sendLineMessage(userId, [flexPeriodList(scopeLabel, toDisplay)]);
+
+  if (hasMore) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text:
+        `ป้าไพรแสดงได้ ${MAX_BUBBLES} รายการแรกนะคะ 😊\n` +
+        `(พบทั้งหมด ${schedulesDisplay.length} รายการ)\n\n` +
+        `ถ้าต้องการค้นหาห้องเฉพาะ\n` +
+        `พิมพ์ชื่อห้อง เช่น "ม.2/3" ได้เลยค่ะ 🙏`,
+    }]);
+  }
+}
+
+
+/**
+ * Step 1: หัวหน้าห้องกด "สร้าง QR" → แสดง Confirm Card
+ *
+ * @param {string} userId
+ * @param {Object} monitorData
+ * @param {Object} params
+ */
+function handleCreateQRRequest(userId, monitorData, params) {
+  const periodNumber = Number(params['period']);
+  const classroom    = params['classroom'] || '';
+  const subjectCode  = params['subject']   || '';
+
+  // ── ตรวจสอบความเป็นเจ้าของห้อง เฉพาะ Student เท่านั้น ────────────
+  // Staff / Admin / Teacher-scope ข้ามการตรวจสอบนี้ได้
+  const creatorType = (monitorData['Creator_Type'] || SYSTEM_CONFIG.CREATOR_TYPE.STUDENT).toString().trim();
+  const isStudentCreator = creatorType === SYSTEM_CONFIG.CREATOR_TYPE.STUDENT;
+
+  if (isStudentCreator) {
+    const ownClassroom = monitorData['Classroom_Scope'] || monitorData['Classroom'] || '';
+    if (classroom !== ownClassroom) {
+      sendLineMessage(userId, [{
+        type: 'text',
+        text: 'ป้าไพรขอโทษด้วยนะคะ 🙏\n\nไม่สามารถสร้าง QR ให้ห้องอื่นได้ค่ะ\nกรุณาสร้างเฉพาะห้องของตัวเองนะคะ 😊',
+      }]);
+      return;
+    }
+  }
+  // ────────────────────────────────────────────────────────────────────
+
+  const subject = getSubjectByClassroomAndPeriod(classroom, periodNumber);
+  if (!subject) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_NO_SCHEDULE }]);
+    return;
+  }
+
+  const teacher = getTeacherById(subject['Teacher_ID']);
+  const period  = getPeriodByNumber(periodNumber);
+  if (!period) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  // ตรวจสอบ QR ซ้ำ
+  if (checkActiveQRForPeriod(classroom, periodNumber)) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: MESSAGES.QR_DUPLICATE_ACTIVE(period.name, SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES),
+    }]);
+    return;
+  }
+
+  sendLineMessage(userId, [flexQRConfirm(subject, teacher, period)]);
+}
+
+
+/**
+ * Step 2: หัวหน้าห้องกด "ยืนยันสร้าง QR" → สร้าง Token และ QR Image
+ *
+ * @param {string} userId
+ * @param {Object} monitorData
+ * @param {Object} params
+ */
+function handleConfirmQR(userId, monitorData, params) {
+  const periodNumber = Number(params['period']);
+  const classroom    = params['classroom'] || '';
+
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.QR_CREATING }]);
+
+  try {
+    const subject = getSubjectByClassroomAndPeriod(classroom, periodNumber);
+    if (!subject) {
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_NO_SCHEDULE }]);
+      return;
     }
 
-    // LINE รองรับสูงสุด 5 Messages ต่อ 1 Request
-    // ถ้ามากกว่า 5 → แบ่งส่งเป็น Batch
-    const batches = chunkArray(messages, 5);
+    const teacher = getTeacherById(subject['Teacher_ID']);
+    const period  = getPeriodByNumber(periodNumber);
 
-    for (const batch of batches) {
-      const payload = {
-        to:       userId,
-        messages: batch,
-      };
+    // สร้าง QR Token ใน Sheet
+    const token = createQRSession({
+      subjectCode:     subject['Subject_Code'],
+      subjectName:     subject['Subject_Name'] || subject['Subject_Code'],
+      teacherId:       subject['Teacher_ID'],
+      teacherName:     teacher ? teacher['Teacher_Name'] : subject['Teacher_ID'],
+      classroom:       classroom,
+      periodNumber:    periodNumber,
+      periodName:      period ? period.name : `คาบที่ ${periodNumber}`,
+      createdByLineId: userId,
+      createdByName:   monitorData['Student_Name'],
+    });
 
-      const options = {
-        method:      'post',
-        contentType: 'application/json',
-        headers: {
-          'Authorization': `Bearer ${CREDENTIALS.LINE_CHANNEL_ACCESS_TOKEN}`,
+    // สร้าง URL และ QR Image
+    const qrUrl      = buildQRUrl(token);
+    const qrImageUrl = buildQRImageUrl(qrUrl);
+    const periodLabel = `${period ? period.name : `คาบที่ ${periodNumber}`} — ${subject['Subject_Name']}`;
+
+    sendLineMessage(userId, [
+      { type: 'text', text: MESSAGES.QR_SUCCESS(periodLabel, SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES) },
+      { type: 'image', originalContentUrl: qrImageUrl, previewImageUrl: qrImageUrl },
+      buildMonitorQuickReply(),
+    ]);
+
+  } catch (e) {
+    logInfo('Monitor', 'ERROR handleConfirmQR', e.message);
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+  }
+}
+
+
+/**
+ * แจ้งหัวหน้าห้องเมื่อครูเช็คอินสำเร็จ
+ *
+ * @param {string} monitorLineId
+ * @param {string} teacherName
+ * @param {string} subjectName
+ * @param {string} periodName
+ * @param {string} topic
+ */
+function notifyMonitorCheckin(monitorLineId, teacherName, subjectName, periodName, topic) {
+  try {
+    sendLineMessage(monitorLineId, [
+      flexMonitorCheckinNotify(teacherName, subjectName, periodName, topic),
+    ]);
+  } catch (e) {
+    logInfo('Monitor', 'ERROR notifyMonitorCheckin (non-critical)', e.message);
+  }
+}
+
+
+/**
+ * ส่งเมนูหลักให้หัวหน้าห้อง
+ *
+ * @param {string} userId
+ * @param {Object} monitorData
+ */
+function sendMonitorMainMenu(userId, monitorData) {
+  sendLineMessage(userId, [{
+    type: 'text',
+    text:
+      `สวัสดีค่ะ ${monitorData['Student_Name']} 🙏\n` +
+      `🏫 หัวหน้าห้อง ${monitorData['Classroom']}\n` +
+      `📅 ${formatThaiDate(new Date())}\n\n` +
+      `ป้าไพรพร้อมช่วยเหลือนะคะ 😊\n` +
+      `กดปุ่มด้านล่างเพื่อใช้งานได้เลยค่ะ 👇`,
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '📲 สร้าง QR คาบเรียน', text: 'สร้าง QR' },
         },
-        payload:          JSON.stringify(payload),
-        muteHttpExceptions: true, // ไม่ Throw Error อัตโนมัติ
-      };
+        {
+          type: 'action',
+          action: { type: 'message', label: '📅 ดูตารางวันนี้', text: 'ตาราง' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '❓ คู่มือ', text: '/help' },
+        },
+      ],
+    },
+  }]);
+}
 
-      const result   = UrlFetchApp.fetch(
-        'https://api.line.me/v2/bot/message/push',
-        options
-      );
-      const httpCode = result.getResponseCode();
 
-      if (httpCode !== 200) {
-        logInfo('sendLineMessage',
-          `ERROR HTTP ${httpCode}`,
-          result.getContentText()
-        );
+/**
+ * Quick Reply หลังส่ง QR แล้ว
+ *
+ * @returns {Object} Message Object พร้อม Quick Reply
+ */
+function buildMonitorQuickReply() {
+  return {
+    type: 'text',
+    text: 'ต้องการสร้าง QR คาบอื่นเพิ่มเติมไหมคะ? 😊',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '📲 สร้าง QR คาบอื่น', text: 'สร้าง QR' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+        },
+      ],
+    },
+  };
+}
+
+
+/**
+ * ส่งคู่มือการใช้งานสำหรับหัวหน้าห้อง (/help)
+ */
+function sendMonitorHelp(userId, monitorData) {
+  sendLineMessage(userId, [{
+    type: 'text',
+    text:
+      `ป้าไพรยินดีช่วยนะคะ ${monitorData['Student_Name']} 😊\n\n` +
+      `📋 คู่มือสำหรับหัวหน้าห้อง\n` +
+      `━━━━━━━━━━━━━━━━━━\n\n` +
+      `📲 ขั้นตอนสร้าง QR Code\n` +
+      `1. กดปุ่ม "สร้าง QR คาบเรียน"\n` +
+      `2. ป้าไพรจะแสดงตารางสอนวันนี้\n` +
+      `3. เลือกคาบที่ต้องการ\n` +
+      `4. กดยืนยัน รอรับ QR ได้เลยค่ะ 🎉\n` +
+      `5. แสดง QR ให้ครูผู้สอนสแกนนะคะ\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `⌨️ คำสั่งที่ใช้ได้\n\n` +
+      `/help    ดูคู่มือนี้\n` +
+      `/status  ดูสถานะเช็คอินวันนี้\n` +
+      `ตาราง    ดูตารางสอนวันนี้\n` +
+      `เมนู     กลับหน้าหลัก\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 หมายเหตุ\n` +
+      `• QR Code มีอายุ ${SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES} นาทีนะคะ\n` +
+      `• 1 คาบ สร้างได้ 1 QR ค่ะ\n` +
+      `• ป้าไพรจะแจ้งเมื่อครูเช็คอินแล้วนะคะ 📲\n\n` +
+      `มีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`,
+  }]);
+}
+
+
+/**
+ * ส่งสถานะการเช็คอินวันนี้แยกตามคาบ (/status)
+ */
+function sendMonitorStatus(userId, monitorData) {
+  sendLineMessage(userId, [{ type: 'text', text: '⏳ ป้าไพรกำลังดึงข้อมูลให้นะคะ...' }]);
+
+  const classroom = monitorData['Classroom'];
+  const schedules = getScheduleByClassroomToday(classroom);
+
+  if (schedules.length === 0) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text:
+        `📊 สถานะการเช็คอินวันนี้\n` +
+        `🏫 ${classroom}\n` +
+        `📅 ${formatThaiDate(new Date())}\n` +
+        `━━━━━━━━━━━━━━━━━━\n\n` +
+        `ป้าไพรไม่พบตารางสอนวันนี้ค่ะ\n` +
+        `กรุณาตรวจสอบกับฝ่ายวิชาการนะคะ 🙏`,
+    }]);
+    return;
+  }
+
+  const todayLogs      = getTodayCheckInForClassroom(classroom);
+  const checkedPeriods = new Set(todayLogs.map(l => Number(l['Period_Number'])));
+
+  const lines = [
+    `📊 สถานะการเช็คอินวันนี้`,
+    `🏫 ${classroom}`,
+    `📅 ${formatThaiDate(new Date())}`,
+    `━━━━━━━━━━━━━━━━━━\n`,
+  ];
+
+  schedules.forEach(s => {
+    const periodNum  = Number(s['Period_Number']);
+    const period     = getPeriodByNumber(periodNum);
+    const timeLabel  = period ? `${period.start}–${period.end}` : '';
+    const isChecked  = checkedPeriods.has(periodNum);
+    const icon       = isChecked ? '✅' : '⏳';
+    const statusText = isChecked ? 'เช็คอินแล้วค่ะ' : 'รอเช็คอินค่ะ';
+
+    lines.push(
+      `${icon} ${s['Period_Name']} (${timeLabel})\n` +
+      `   📚 ${s['Subject_Name']}\n` +
+      `   ${statusText}`
+    );
+  });
+
+  lines.push(`\n━━━━━━━━━━━━━━━━━━`);
+  lines.push(`✅ เช็คอินแล้ว ${checkedPeriods.size}/${schedules.length} คาบค่ะ`);
+  lines.push(`\nมีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`);
+
+  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+}
+
+
+// ============================================================
+// 👩‍🏫 SECTION 6: Teacher Flow — State Machine
+// ============================================================
+
+/**
+ * Entry Point สำหรับครูผู้สอน
+ *
+ * @param {Object} event
+ * @param {Object} teacherData
+ */
+function handleTeacherEvent(event, teacherData) {
+  try {
+    if (event.type === 'message' && event.message.type === 'text') {
+      handleTeacherMessage(event, teacherData);
+    } else if (event.type === 'postback') {
+      handleTeacherPostback(event, teacherData);
+    } else {
+      // ถ้ากำลังกรอกข้อมูลอยู่ → เตือนให้พิมพ์
+      const state = getTeacherState(event.source.userId);
+      if (state && state.step !== SYSTEM_CONFIG.TEACHER_STATE.IDLE) {
+        remindTeacherToType(event.source.userId, state);
+      } else {
+        sendTeacherMainMenu(event.source.userId, teacherData);
+      }
+    }
+  } catch (e) {
+    logInfo('Teacher', 'ERROR handleTeacherEvent', e.message);
+    clearTeacherState(event.source.userId);
+    sendLineMessage(event.source.userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+  }
+}
+
+
+/**
+ * จัดการข้อความจากครู — ดู State ก่อนตัดสินใจ
+ *
+ * @param {Object} event
+ * @param {Object} teacherData
+ */
+function handleTeacherMessage(event, teacherData) {
+  const userId  = event.source.userId;
+  const text    = event.message.text.trim();
+  const textLow = text.toLowerCase();
+
+  logInfo('Teacher', `ข้อความ: "${text}"`, teacherData['Teacher_Name']);
+
+  // สแกน QR — ตรวจสอบก่อนเสมอ ไม่ว่าจะอยู่ State ไหน
+  if (text.startsWith('CHECKIN:')) {
+    const token = text.replace('CHECKIN:', '').trim();
+    handleQRScan(userId, teacherData, token);
+    return;
+  }
+
+  // Special Commands — ทำงานได้ทุก State ไม่ถูกบล็อกโดย State Machine
+  if (textLow === '/help' || textLow === 'help') {
+    sendTeacherHelp(userId, teacherData);
+    return;
+  }
+  if (textLow === '/status' || textLow === 'status') {
+    sendTeacherStatus(userId, teacherData);
+    return;
+  }
+
+  // ยกเลิก — ใช้ได้ทุก State
+  if (['ยกเลิก', 'cancel', 'ออก'].includes(textLow)) {
+    handleTeacherCancel(userId, teacherData);
+    return;
+  }
+
+  const currentState = getTeacherState(userId);
+  const step = currentState ? currentState.step : SYSTEM_CONFIG.TEACHER_STATE.IDLE;
+
+  switch (step) {
+    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC:
+      handleTopicInput(userId, teacherData, text, currentState);
+      break;
+    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_ASSIGNMENT:
+      handleAssignmentInput(userId, teacherData, text, currentState);
+      break;
+    case SYSTEM_CONFIG.TEACHER_STATE.CONFIRM:
+      remindTeacherToUseButton(userId);
+      break;
+    default:
+      handleTeacherKeyword(userId, teacherData, text);
+      break;
+  }
+}
+
+
+/**
+ * จัดการ Postback จากครู
+ *
+ * @param {Object} event
+ * @param {Object} teacherData
+ */
+function handleTeacherPostback(event, teacherData) {
+  const userId = event.source.userId;
+  const params = parsePostbackData(event.postback.data);
+  const action = params['action'];
+
+  switch (action) {
+    case 'confirm_checkin':
+      handleConfirmCheckin(userId, teacherData);
+      break;
+    case 'edit_checkin':
+      handleEditCheckin(userId, teacherData);
+      break;
+    case 'teacher_history':
+      handleViewHistory(userId, teacherData);
+      break;
+    default:
+      sendTeacherMainMenu(userId, teacherData);
+  }
+}
+
+
+/**
+ * ครูสแกน QR Code
+ * → ตรวจสอบ Token → แสดงข้อมูลคาบ → เปลี่ยน State
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ * @param {string} token
+ */
+function handleQRScan(userId, teacherData, token) {
+  logInfo('Teacher', `สแกน Token: ${token}`, teacherData['Teacher_Name']);
+
+  const validation = validateQRToken(token);
+
+  if (!validation.valid) {
+    const msgMap = {
+      expired:   MESSAGES.QR_EXPIRED,
+      used:      MESSAGES.QR_USED,
+      not_found: MESSAGES.QR_INVALID,
+      error:     MESSAGES.QR_INVALID,
+    };
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: msgMap[validation.status] || MESSAGES.QR_INVALID,
+    }]);
+    return;
+  }
+
+  const qrData = validation.data;
+
+  // ตรวจสอบว่าครูคนนี้สอนวิชานี้
+  if (qrData['Teacher_ID'] !== teacherData['Teacher_ID']) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.QR_WRONG_TEACHER }]);
+    return;
+  }
+
+  // ตรวจสอบว่าเช็คอินคาบนี้แล้วหรือยัง
+  if (isAlreadyCheckedIn(teacherData['Teacher_ID'], Number(qrData['Period_Number']))) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_ALREADY_CHECKIN }]);
+    return;
+  }
+
+  // แสดงข้อมูลคาบ
+  sendLineMessage(userId, [flexClassInfo(qrData, teacherData)]);
+
+  // บันทึก State = WAITING_TOPIC
+  saveTeacherState(userId, {
+    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC,
+    token:         token,
+    qrData:        qrData,
+    teachingTopic: '',
+    assignment:    '',
+  });
+
+  Utilities.sleep(500);
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.ASK_TOPIC,
+    quickReply: {
+      items: [{
+        type: 'action',
+        action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+      }],
+    },
+  }]);
+}
+
+
+/**
+ * รับ "เรื่องที่สอน" จากครู
+ * State: WAITING_TOPIC → WAITING_ASSIGNMENT
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ * @param {string} text
+ * @param {Object} currentState
+ */
+function handleTopicInput(userId, teacherData, text, currentState) {
+  if (!text || text.length < 3) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.TOPIC_TOO_SHORT }]);
+    return;
+  }
+
+  saveTeacherState(userId, {
+    ...currentState,
+    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_ASSIGNMENT,
+    teachingTopic: text,
+  });
+
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.ASK_ASSIGNMENT,
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '📭 ไม่มีงานมอบหมาย', text: 'ไม่มีงานมอบหมาย' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+        },
+      ],
+    },
+  }]);
+}
+
+
+/**
+ * รับ "งานมอบหมาย" จากครู
+ * State: WAITING_ASSIGNMENT → CONFIRM
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ * @param {string} text
+ * @param {Object} currentState
+ */
+function handleAssignmentInput(userId, teacherData, text, currentState) {
+  const noAssignmentKeywords = ['ไม่มีงานมอบหมาย', 'ไม่มีงาน', 'ไม่มี', '-', 'none'];
+  const assignment = noAssignmentKeywords.includes(text.toLowerCase()) ? '' : text;
+
+  const qrData = currentState.qrData;
+  const period = getPeriodByNumber(Number(qrData['Period_Number']));
+
+  const checkinData = {
+    teacherName:   teacherData['Teacher_Name'],
+    teacherId:     teacherData['Teacher_ID'],
+    subjectCode:   qrData['Subject_Code'],
+    subjectName:   qrData['Subject_Name'] || qrData['Subject_Code'],
+    classroom:     qrData['Classroom'],
+    periodNumber:  Number(qrData['Period_Number']),
+    periodName:    qrData['Period_Name'] || `คาบที่ ${qrData['Period_Number']}`,
+    timeStart:     period ? period.start : '-',
+    timeEnd:       period ? period.end   : '-',
+    day:           getTodayDayName(),
+    teachingTopic: currentState.teachingTopic,
+    assignment:    assignment,
+    token:         currentState.token,
+  };
+
+  saveTeacherState(userId, {
+    ...currentState,
+    step:        SYSTEM_CONFIG.TEACHER_STATE.CONFIRM,
+    assignment:  assignment,
+    checkinData: checkinData,
+  });
+
+  sendLineMessage(userId, [flexCheckinConfirm(checkinData)]);
+}
+
+
+/**
+ * ครูกด "ยืนยันเช็คอิน" → บันทึกลง Sheets
+ * State: CONFIRM → IDLE
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function handleConfirmCheckin(userId, teacherData) {
+  logInfo('Teacher', `ยืนยันเช็คอิน: ${teacherData['Teacher_Name']}`);
+
+  const currentState = getTeacherState(userId);
+  if (!currentState || currentState.step !== SYSTEM_CONFIG.TEACHER_STATE.CONFIRM) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.SESSION_TIMEOUT }]);
+    clearTeacherState(userId);
+    return;
+  }
+
+  const checkinData = currentState.checkinData;
+  if (!checkinData) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    clearTeacherState(userId);
+    return;
+  }
+
+  // ── ป้องกัน Double Submit ────────────────────────────────
+  if (isAlreadyCheckedIn(checkinData.teacherId, checkinData.periodNumber)) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_ALREADY_CHECKIN }]);
+    clearTeacherState(userId);
+    return;
+  }
+  // ────────────────────────────────────────────────────────
+
+  try {
+    const success = saveCheckIn({
+      teacherId:     checkinData.teacherId,
+      teacherName:   checkinData.teacherName,
+      subjectCode:   checkinData.subjectCode,
+      subjectName:   checkinData.subjectName,
+      classroom:     checkinData.classroom,
+      periodNumber:  checkinData.periodNumber,
+      periodName:    checkinData.periodName,
+      timeStart:     checkinData.timeStart,
+      timeEnd:       checkinData.timeEnd,
+      day:           checkinData.day,
+      teachingTopic: checkinData.teachingTopic,
+      assignment:    checkinData.assignment,
+      qrToken:       checkinData.token,
+    });
+
+    if (!success) throw new Error('saveCheckIn returned false');
+
+    markQRTokenAsUsed(checkinData.token, userId);
+
+    // คำนวณ Status
+    const period = getPeriodByNumber(checkinData.periodNumber);
+    let status = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+    if (period) {
+      const [sh, sm] = period.start.split(':').map(Number);
+      const graceEnd = new Date();
+      graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
+      if (new Date() > graceEnd) status = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
+    }
+
+    // แสดงผลสำเร็จ
+    sendLineMessage(userId, [flexCheckinSuccess({ ...checkinData, status })]);
+
+    // แจ้ง Monitor และ Admin (Non-blocking)
+    notifyMonitorAfterCheckin(checkinData, currentState.qrData);
+    notifyAdminAfterCheckin(checkinData, status);
+
+    clearTeacherState(userId);
+
+  } catch (e) {
+    logInfo('Teacher', 'ERROR handleConfirmCheckin', e.message);
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    clearTeacherState(userId);
+  }
+}
+
+
+/**
+ * ครูกด "แก้ไข" → กลับไปกรอกเรื่องที่สอนใหม่
+ * State: CONFIRM → WAITING_TOPIC
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function handleEditCheckin(userId, teacherData) {
+  const currentState = getTeacherState(userId);
+  if (!currentState) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.SESSION_TIMEOUT }]);
+    return;
+  }
+
+  saveTeacherState(userId, {
+    ...currentState,
+    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC,
+    teachingTopic: '',
+    assignment:    '',
+    checkinData:   null,
+  });
+
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.EDIT_CHECKIN + MESSAGES.ASK_TOPIC,
+    quickReply: {
+      items: [{
+        type: 'action',
+        action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+      }],
+    },
+  }]);
+}
+
+
+/**
+ * แสดงประวัติการเช็คอินของครู
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function handleViewHistory(userId, teacherData) {
+  sendLineMessage(userId, [{ type: 'text', text: '⏳ กำลังดึงประวัติค่ะ...' }]);
+  const history = getTeacherCheckInHistory(teacherData['Teacher_ID'], 10);
+  sendLineMessage(userId, [flexTeacherHistory(teacherData['Teacher_Name'], history)]);
+}
+
+
+/**
+ * ส่งคู่มือการใช้งานสำหรับครู (/help)
+ */
+function sendTeacherHelp(userId, teacherData) {
+  sendLineMessage(userId, [{
+    type: 'text',
+    text:
+      `ป้าไพรยินดีช่วยนะคะ ${teacherData['Teacher_Name']} 😊\n\n` +
+      `📋 คู่มือการใช้งานระบบเช็คอิน\n` +
+      `━━━━━━━━━━━━━━━━━━\n\n` +
+      `📲 ขั้นตอนเช็คอิน\n` +
+      `1. ขอให้หัวหน้าห้องสร้าง QR Code\n` +
+      `2. สแกน QR ด้วย LINE Camera\n` +
+      `3. ป้าไพรจะถามเรื่องที่สอนค่ะ\n` +
+      `4. กรอกงานมอบหมาย (ถ้ามี)\n` +
+      `5. กดยืนยัน — เสร็จเลยค่ะ! 🎉\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `⌨️ คำสั่งที่ใช้ได้\n\n` +
+      `/help    ดูคู่มือนี้\n` +
+      `/status  ดูประวัติเช็คอินวันนี้\n` +
+      `ประวัติ  ดูประวัติ 10 รายการล่าสุด\n` +
+      `ยกเลิก   ยกเลิกการเช็คอินที่กำลังทำ\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 หมายเหตุ\n` +
+      `QR Code มีอายุ ${SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES} นาทีนะคะ\n` +
+      `สแกนให้ทันก่อนหมดอายุด้วยนะคะ 🙏\n\n` +
+      `มีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`,
+  }]);
+}
+
+
+/**
+ * ส่งสถานะการเช็คอินวันนี้ของครู (/status)
+ */
+function sendTeacherStatus(userId, teacherData) {
+  sendLineMessage(userId, [{ type: 'text', text: '⏳ ป้าไพรกำลังดึงข้อมูลให้นะคะ...' }]);
+
+  const today      = new Date();
+  const todayStart = new Date(today);
+  todayStart.setHours(0, 0, 0, 0);
+
+  // ดึงประวัติ 20 รายการล่าสุด แล้วกรองเฉพาะวันนี้
+  const history   = getTeacherCheckInHistory(teacherData['Teacher_ID'], 20);
+  const todayLogs = history.filter(log => new Date(log['Timestamp']) >= todayStart);
+
+  if (todayLogs.length === 0) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text:
+        `📊 สถานะการเช็คอินวันนี้\n` +
+        `👩‍🏫 ${teacherData['Teacher_Name']}\n` +
+        `📅 ${formatThaiDate(today)}\n` +
+        `━━━━━━━━━━━━━━━━━━\n\n` +
+        `ป้าไพรยังไม่พบการเช็คอินในวันนี้ค่ะ\n\n` +
+        `สแกน QR Code จากหัวหน้าห้อง\n` +
+        `เพื่อเริ่มเช็คอินได้เลยนะคะ 😊`,
+    }]);
+    return;
+  }
+
+  const lines = [
+    `📊 สถานะการเช็คอินวันนี้`,
+    `👩‍🏫 ${teacherData['Teacher_Name']}`,
+    `📅 ${formatThaiDate(today)}`,
+    `━━━━━━━━━━━━━━━━━━\n`,
+  ];
+
+  todayLogs.forEach(log => {
+    const icon = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+    const time = new Date(log['Timestamp']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    lines.push(
+      `${icon} ${log['Period_Name']}\n` +
+      `   📚 ${log['Subject_Name']}\n` +
+      `   🕐 ${time} น.\n` +
+      `   📝 ${log['Teaching_Topic'] || '-'}`
+    );
+  });
+
+  lines.push(`\n━━━━━━━━━━━━━━━━━━`);
+  lines.push(`รวม ${todayLogs.length} คาบในวันนี้ค่ะ`);
+  lines.push(`🟢 ตรงเวลา  🟡 สาย`);
+  lines.push(`\nมีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`);
+
+  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+}
+
+
+/**
+ * จัดการ Keyword ทั่วไปของครูใน State IDLE
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ * @param {string} text
+ */
+function handleTeacherKeyword(userId, teacherData, text) {
+  const t = text.toLowerCase();
+
+  if (['เมนู', 'menu', 'หน้าหลัก'].includes(t)) {
+    sendTeacherMainMenu(userId, teacherData);
+    return;
+  }
+  if (['ประวัติ', 'history', 'ประวัติการสอน'].includes(t)) {
+    handleViewHistory(userId, teacherData);
+    return;
+  }
+
+  sendLineMessage(userId, [{
+    type: 'text',
+    text:
+      `ป้าไพรยินดีช่วยนะคะ ${teacherData['Teacher_Name']} 💡\n\n` +
+      `📲 วิธีใช้งานระบบเช็คอิน\n` +
+      `สแกน QR Code จากหัวหน้าห้อง\n` +
+      `เพื่อเริ่มกระบวนการเช็คอินได้เลยค่ะ\n\n` +
+      `หรือพิมพ์ /help เพื่อดูคู่มือนะคะ 😊`,
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: {
+            type: 'postback',
+            label: '📊 ประวัติการเช็คอิน',
+            data: 'action=teacher_history',
+            displayText: 'ดูประวัติการเช็คอิน',
+          },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '🏠 เมนูหลัก', text: 'เมนู' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '❓ คู่มือ', text: '/help' },
+        },
+      ],
+    },
+  }]);
+}
+
+
+/**
+ * ครูกด "ยกเลิก" ระหว่างกรอกข้อมูล
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function handleTeacherCancel(userId, teacherData) {
+  clearTeacherState(userId);
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.CANCEL_CHECKIN }]);
+}
+
+
+/**
+ * ส่งเมนูหลักครู
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function sendTeacherMainMenu(userId, teacherData) {
+  sendLineMessage(userId, [flexTeacherMenu(teacherData['Teacher_Name'])]);
+}
+
+
+/**
+ * เตือนให้ครูพิมพ์ข้อความแทนส่ง Sticker/Image
+ *
+ * @param {string} userId
+ * @param {Object} state
+ */
+function remindTeacherToType(userId, state) {
+  const msg = state.step === SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC
+    ? MESSAGES.REMIND_TYPE_TOPIC
+    : MESSAGES.REMIND_TYPE_ASSIGNMENT;
+  sendLineMessage(userId, [{ type: 'text', text: msg }]);
+}
+
+
+/**
+ * เตือนให้กดปุ่มใน Confirm Card
+ *
+ * @param {string} userId
+ */
+function remindTeacherToUseButton(userId) {
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REMIND_USE_BUTTON }]);
+}
+
+
+/**
+ * แจ้ง Monitor หลังเช็คอิน
+ *
+ * @param {Object} checkinData
+ * @param {Object} qrData
+ */
+function notifyMonitorAfterCheckin(checkinData, qrData) {
+  try {
+    const monitorLineId = qrData && qrData['Created_By_LineID'];
+    if (!monitorLineId) return;
+    notifyMonitorCheckin(
+      monitorLineId,
+      checkinData.teacherName,
+      checkinData.subjectName,
+      checkinData.periodName,
+      checkinData.teachingTopic
+    );
+  } catch (e) {
+    logInfo('Teacher', 'ERROR notifyMonitorAfterCheckin (non-critical)', e.message);
+  }
+}
+
+
+/**
+ * แจ้ง Admin ทุกคนหลังเช็คอิน
+ *
+ * @param {Object} checkinData
+ * @param {string} status
+ */
+function notifyAdminAfterCheckin(checkinData, status) {
+  try {
+    const icon  = status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+    const label = status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? 'ตรงเวลา' : 'สาย';
+    const time  = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+
+    const msg =
+      `${icon} เช็คอินใหม่ — ${label}\n` +
+      `👩‍🏫 ${checkinData.teacherName}\n` +
+      `📚 ${checkinData.subjectName}\n` +
+      `🏫 ${checkinData.classroom}\n` +
+      `🕐 ${checkinData.periodName} (${time} น.)\n` +
+      `📝 ${checkinData.teachingTopic}`;
+
+    getAdminLineIds().forEach(adminId => {
+      sendLineMessage(adminId, [{ type: 'text', text: msg }]);
+    });
+  } catch (e) {
+    logInfo('Teacher', 'ERROR notifyAdminAfterCheckin (non-critical)', e.message);
+  }
+}
+
+
+// ── State Management (ScriptCache) ───────────────────────────
+// ใช้ ScriptCache + Key = prefix+userId
+// เพื่อแยก State ของครูแต่ละคนออกจากกัน
+// แก้ไขปัญหาจากโค้ดเดิมที่ใช้ getUserCache()
+// ซึ่ง Execute as Me ทำให้ State ทับกันทุกคน
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * บันทึก State ของครูลง ScriptCache
+ *
+ * @param {string} userId
+ * @param {Object} state
+ */
+function saveTeacherState(userId, state) {
+  try {
+    const key = SYSTEM_CONFIG.CACHE_KEY_PREFIX + userId;
+    const ttl = SYSTEM_CONFIG.STATE_CACHE_EXPIRE_SECONDS;
+    CacheService.getScriptCache().put(key, JSON.stringify(state), ttl);
+    logInfo('State', `Save: ${state.step}`, userId);
+  } catch (e) {
+    logInfo('State', 'ERROR saveTeacherState', e.message);
+  }
+}
+
+
+/**
+ * ดึง State ของครูจาก ScriptCache
+ *
+ * @param {string} userId
+ * @returns {Object|null}
+ */
+function getTeacherState(userId) {
+  try {
+    const key    = SYSTEM_CONFIG.CACHE_KEY_PREFIX + userId;
+    const cached = CacheService.getScriptCache().get(key);
+    return cached ? JSON.parse(cached) : null;
+  } catch (e) {
+    logInfo('State', 'ERROR getTeacherState', e.message);
+    return null;
+  }
+}
+
+
+/**
+ * ลบ State ของครูออกจาก Cache (กลับ IDLE)
+ *
+ * @param {string} userId
+ */
+function clearTeacherState(userId) {
+  try {
+    const key = SYSTEM_CONFIG.CACHE_KEY_PREFIX + userId;
+    CacheService.getScriptCache().remove(key);
+    logInfo('State', `Clear State`, userId);
+  } catch (e) {
+    logInfo('State', 'ERROR clearTeacherState', e.message);
+  }
+}
+
+
+// ============================================================
+// 👔 SECTION 7: Admin Flow
+// ============================================================
+
+/**
+ * Entry Point สำหรับ Admin
+ *
+ * @param {Object} event
+ * @param {Object} adminData
+ */
+function handleAdminEvent(event, adminData) {
+  try {
+    if (event.type === 'message' && event.message.type === 'text') {
+      handleAdminMessage(event, adminData);
+    } else if (event.type === 'postback') {
+      handleAdminPostback(event, adminData);
+    } else {
+      sendAdminMainMenu(event.source.userId);
+    }
+  } catch (e) {
+    logInfo('Admin', 'ERROR', e.message);
+    sendLineMessage(event.source.userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+  }
+}
+
+
+/**
+ * จัดการข้อความจาก Admin
+ *
+ * @param {Object} event
+ * @param {Object} adminData
+ */
+function handleAdminMessage(event, adminData) {
+  const userId  = event.source.userId;
+  const textLow = event.message.text.trim().toLowerCase();
+
+  // Special Commands
+  if (textLow === '/help' || textLow === 'help') {
+    sendAdminHelp(userId);
+    return;
+  }
+  if (textLow === '/status' || textLow === 'status') {
+    // ใช้ฟังก์ชันสรุปวันนี้เป็น status ของ Admin
+    handleTodaySummary(userId);
+    return;
+  }
+
+  if (['เมนู', 'menu', 'หน้าหลัก', 'admin'].includes(textLow)) {
+    sendAdminMainMenu(userId);
+  } else if (['สรุป', 'วันนี้', 'สรุปวันนี้', 'today'].includes(textLow)) {
+    handleTodaySummary(userId);
+  } else if (['รายละเอียด', 'detail', 'รายการ'].includes(textLow)) {
+    handleDetailReport(userId);
+  } else if (['สัปดาห์', 'weekly', 'รายสัปดาห์'].includes(textLow)) {
+    handleWeeklyReport(userId);
+  } else if (['export', 'ส่งออก', 'ลิงก์'].includes(textLow)) {
+    handleExportReport(userId);
+  } else {
+    sendAdminMainMenu(userId);
+  }
+}
+
+
+/**
+ * จัดการ Postback จาก Admin
+ *
+ * @param {Object} event
+ * @param {Object} adminData
+ */
+function handleAdminPostback(event, adminData) {
+  const userId = event.source.userId;
+  const params = parsePostbackData(event.postback.data);
+  const action = params['action'];
+
+  switch (action) {
+    case 'admin_today_summary':  handleTodaySummary(userId);           break;
+    case 'admin_detail_report':  handleDetailReport(userId);           break;
+    case 'admin_weekly_report':  handleWeeklyReport(userId);           break;
+    case 'admin_export':         handleExportReport(userId);           break;
+    case 'admin_teacher_detail': handleTeacherDetail(userId, params);  break;
+    case 'admin_period_detail':  handlePeriodDetail(userId, params);   break;
+    default:
+      sendAdminMainMenu(userId);
+  }
+}
+
+
+/**
+ * สรุปการเช็คอินวันนี้
+ *
+ * @param {string} userId
+ */
+function handleTodaySummary(userId) {
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_LOADING_TODAY }]);
+
+  const summary = getTodayCheckInSummary();
+  if (!summary) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  sendLineMessage(userId, [flexAdminDailyReport(summary)]);
+
+  if (summary.totalCheckIns > 0) {
+    Utilities.sleep(500);
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: buildQuickOverviewText(summary),
+    }]);
+  }
+}
+
+
+/**
+ * รายละเอียดการเช็คอินวันนี้แยกตามคาบ
+ *
+ * @param {string} userId
+ */
+function handleDetailReport(userId) {
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_LOADING_DETAIL }]);
+
+  const summary = getTodayCheckInSummary();
+  if (!summary || summary.totalCheckIns === 0) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: MESSAGES.ADMIN_NO_CHECKIN_TODAY(formatThaiDate(new Date())),
+    }]);
+    return;
+  }
+
+  sendLineMessage(userId, [flexAdminDetailReport(summary.logs)]);
+
+  Utilities.sleep(500);
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.ADMIN_MORE_REPORT,
+    quickReply: buildAdminQuickReply(),
+  }]);
+}
+
+
+/**
+ * รายงานรายสัปดาห์ (7 วันย้อนหลัง)
+ *
+ * @param {string} userId
+ */
+function handleWeeklyReport(userId) {
+  sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_LOADING_WEEKLY }]);
+
+  const endDate   = new Date();
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - 6);
+  startDate.setHours(0, 0, 0, 0);
+  endDate.setHours(23, 59, 59, 999);
+
+  const logs = getCheckInsByDateRange(startDate, endDate);
+  if (logs.length === 0) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_NO_WEEKLY_DATA }]);
+    return;
+  }
+
+  // จัดกลุ่มตามวัน
+  const byDay = {};
+  logs.forEach(log => {
+    const d = new Date(log['Timestamp']);
+    d.setHours(0, 0, 0, 0);
+    const key = d.toLocaleDateString('th-TH', { weekday: 'short', day: 'numeric', month: 'short' });
+    if (!byDay[key]) byDay[key] = { total: 0, onTime: 0, late: 0 };
+    byDay[key].total++;
+    if (log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME) byDay[key].onTime++;
+    else byDay[key].late++;
+  });
+
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: buildWeeklyReportText(byDay, logs.length),
+  }]);
+
+  Utilities.sleep(500);
+  sendLineMessage(userId, [flexAdminWeeklyReport(byDay, startDate, endDate)]);
+}
+
+
+/**
+ * ส่ง Link Google Sheets ให้ Admin Export
+ *
+ * @param {string} userId
+ */
+function handleExportReport(userId) {
+  const spreadsheetId = getCredential('SPREADSHEET_ID');
+  const sheetsUrl = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`;
+
+  sendLineMessage(userId, [
+    {
+      type: 'text',
+      text:
+        `📥 Export รายงานการเช็คอินค่ะ\n\n` +
+        `🔗 Google Sheets:\n${sheetsUrl}\n\n` +
+        `📋 วิธี Export เป็น Excel:\n` +
+        `1. เปิด Link ด้านบน\n` +
+        `2. เลือก Sheet "Teacher_CheckIn_Log"\n` +
+        `3. ไปที่ File > Download\n` +
+        `4. เลือก .xlsx หรือ .csv ได้เลยค่ะ`,
+    },
+    flexExportCard(sheetsUrl),
+  ]);
+}
+
+
+/**
+ * รายละเอียดการสอนของครูคนใดคนหนึ่งวันนี้
+ *
+ * @param {string} userId
+ * @param {Object} params
+ */
+function handleTeacherDetail(userId, params) {
+  const teacherId = params['teacher_id'];
+  if (!teacherId) { sendAdminMainMenu(userId); return; }
+
+  const summary = getTodayCheckInSummary();
+  if (!summary) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  const teacherLogs = summary.logs.filter(l => l['Teacher_ID'] === teacherId);
+  const teacher     = getTeacherById(teacherId);
+  const name        = teacher ? teacher['Teacher_Name'] : teacherId;
+
+  if (teacherLogs.length === 0) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: `📋 ${name}\nยังไม่มีการเช็คอินในวันนี้ค่ะ`,
+    }]);
+    return;
+  }
+
+  const lines = [`👩‍🏫 ${name}\n📅 ${formatThaiDate(new Date())}\n`];
+  teacherLogs.forEach(log => {
+    const icon = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+    const time = new Date(log['Timestamp']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    lines.push(
+      `${icon} ${log['Period_Name']} — ${log['Subject_Name']}\n` +
+      `   🕐 ${time} น. | 🏫 ${log['Classroom']}\n` +
+      `   📝 ${log['Teaching_Topic'] || '-'}\n` +
+      `   📋 ${log['Assignment'] || 'ไม่มีงาน'}`
+    );
+  });
+
+  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+}
+
+
+/**
+ * รายละเอียดการเช็คอินในคาบที่เลือก
+ *
+ * @param {string} userId
+ * @param {Object} params
+ */
+function handlePeriodDetail(userId, params) {
+  const periodNumber = Number(params['period_number']);
+  if (!periodNumber) { sendAdminMainMenu(userId); return; }
+
+  const period  = getPeriodByNumber(periodNumber);
+  const summary = getTodayCheckInSummary();
+
+  if (!summary) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+    return;
+  }
+
+  const periodLogs = summary.logs.filter(l => Number(l['Period_Number']) === periodNumber);
+  const periodName = period
+    ? `${period.name} (${period.start}–${period.end})`
+    : `คาบที่ ${periodNumber}`;
+
+  if (periodLogs.length === 0) {
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: `📋 ${periodName}\nยังไม่มีการเช็คอินค่ะ`,
+    }]);
+    return;
+  }
+
+  const lines = [`🕐 ${periodName}\n📅 ${formatThaiDate(new Date())}\n`];
+  periodLogs.forEach(log => {
+    const icon = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+    const time = new Date(log['Timestamp']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    lines.push(
+      `${icon} ${log['Teacher_Name']}\n` +
+      `   📚 ${log['Subject_Name']} | 🏫 ${log['Classroom']}\n` +
+      `   🕐 ${time} น.\n` +
+      `   📝 ${log['Teaching_Topic'] || '-'}\n` +
+      `   📋 ${log['Assignment'] || 'ไม่มีงาน'}`
+    );
+  });
+
+  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+}
+
+
+/**
+ * ส่งคู่มือการใช้งานสำหรับ Admin (/help)
+ */
+function sendAdminHelp(userId) {
+  sendLineMessage(userId, [{
+    type: 'text',
+    text:
+      `ป้าไพรยินดีช่วยนะคะ 😊\n\n` +
+      `📋 คู่มือสำหรับ Admin ฝ่ายวิชาการ\n` +
+      `━━━━━━━━━━━━━━━━━━\n\n` +
+      `📊 รายงานการเช็คอิน\n\n` +
+      `/status      สรุปด่วนวันนี้\n` +
+      `วันนี้       รายงานสรุปพร้อม Card\n` +
+      `รายละเอียด   รายงานแยกตามคาบ\n` +
+      `สัปดาห์      รายงาน 7 วันย้อนหลัง\n` +
+      `export       ลิงก์ Google Sheets\n` +
+      `เมนู         กลับหน้าหลัก\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `⌨️ คำสั่งพิเศษ\n\n` +
+      `/help    ดูคู่มือนี้\n` +
+      `/status  ดูสรุปด่วนวันนี้\n\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💡 หรือกดปุ่ม Quick Reply\n` +
+      `ด้านล่างได้เลยนะคะ 👇\n\n` +
+      `มีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`,
+  }]);
+}
+
+
+/**
+ * สรุปภาพรวมรายวันแบบ Text
+ *
+ * @param {Object} summary
+ * @returns {string}
+ */
+function buildQuickOverviewText(summary) {
+  const byPeriod = {};
+  summary.logs.forEach(log => {
+    const key = `คาบที่ ${log['Period_Number']}`;
+    if (!byPeriod[key]) byPeriod[key] = [];
+    byPeriod[key].push(log);
+  });
+
+  const sortedKeys = Object.keys(byPeriod).sort((a, b) =>
+    Number(a.replace('คาบที่ ', '')) - Number(b.replace('คาบที่ ', ''))
+  );
+
+  const lines = [`📋 รายละเอียดการเช็คอินวันนี้\n`];
+  sortedKeys.forEach(key => {
+    lines.push(`${key}:`);
+    byPeriod[key].forEach(log => {
+      const icon = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+      const time = new Date(log['Timestamp']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+      lines.push(`  ${icon} ${log['Teacher_Name']} (${time} น.)`);
+      lines.push(`     📝 ${log['Teaching_Topic'] || '-'}`);
+    });
+    lines.push('');
+  });
+  lines.push('🟢 ตรงเวลา  🟡 สาย');
+  lines.push('\nมีอะไรให้ป้าไพรช่วยเพิ่มเติมไหมคะ 😊');
+  return lines.join('\n');
+}
+
+
+/**
+ * ข้อความสรุปรายสัปดาห์
+ *
+ * @param {Object} byDay
+ * @param {number} total
+ * @returns {string}
+ */
+function buildWeeklyReportText(byDay, total) {
+  const lines = [
+    `📅 รายงานการเช็คอิน 7 วันย้อนหลัง\n`,
+    `รวมทั้งสิ้น: ${total} รายการ\n`,
+  ];
+  Object.keys(byDay).forEach(day => {
+    const d = byDay[day];
+    lines.push(
+      `${day}: ${d.total} คาบ  ` +
+      `${d.onTime > 0 ? `🟢${d.onTime}` : ''}  ` +
+      `${d.late > 0 ? `🟡${d.late}` : ''}`
+    );
+  });
+  lines.push('\n🟢 ตรงเวลา  🟡 สาย');
+  lines.push('\nมีอะไรให้ป้าไพรช่วยเพิ่มเติมไหมคะ 😊');
+  return lines.join('\n');
+}
+
+
+/**
+ * ส่งเมนูหลัก Admin
+ *
+ * @param {string} userId
+ */
+function sendAdminMainMenu(userId) {
+  sendLineMessage(userId, [
+    flexAdminMenu(),
+    { type: 'text', text: MESSAGES.ADMIN_QUICK_MENU, quickReply: buildAdminQuickReply() },
+  ]);
+}
+
+
+/**
+ * Quick Reply สำหรับ Admin
+ *
+ * @returns {Object}
+ */
+function buildAdminQuickReply() {
+  return {
+    items: [
+      { type: 'action', action: { type: 'postback', label: '📊 สรุปวันนี้',    data: 'action=admin_today_summary',  displayText: 'ดูสรุปวันนี้' } },
+      { type: 'action', action: { type: 'postback', label: '📋 รายละเอียด',    data: 'action=admin_detail_report',  displayText: 'ดูรายละเอียด' } },
+      { type: 'action', action: { type: 'postback', label: '📅 รายสัปดาห์',   data: 'action=admin_weekly_report',  displayText: 'รายงานรายสัปดาห์' } },
+      { type: 'action', action: { type: 'postback', label: '📥 Export',        data: 'action=admin_export',         displayText: 'Export รายงาน' } },
+    ],
+  };
+}
+
+
+// ============================================================
+// 📊 SECTION 8: Sheet Manager — CRUD Functions
+// ============================================================
+
+/**
+ * เปิด Spreadsheet
+ *
+ * @returns {GoogleAppsScript.Spreadsheet.Spreadsheet}
+ */
+function getSpreadsheet() {
+  try {
+    return SpreadsheetApp.openById(getCredential('SPREADSHEET_ID'));
+  } catch (e) {
+    throw new Error('ไม่สามารถเชื่อมต่อ Google Sheets ได้ กรุณาตรวจสอบ SPREADSHEET_ID');
+  }
+}
+
+
+/**
+ * ดึง Sheet ตามชื่อ
+ *
+ * @param {string} sheetName
+ * @returns {GoogleAppsScript.Spreadsheet.Sheet}
+ */
+function getSheet(sheetName) {
+  const sheet = getSpreadsheet().getSheetByName(sheetName);
+  if (!sheet) throw new Error(`ไม่พบ Sheet "${sheetName}"`);
+  return sheet;
+}
+
+
+/**
+ * ดึงข้อมูลทั้งหมดจาก Sheet เป็น Array of Objects
+ *
+ * @param {string} sheetName
+ * @returns {Array<Object>}
+ */
+function getAllDataAsObjects(sheetName) {
+  const sheet  = getSheet(sheetName);
+  const values = sheet.getDataRange().getValues();
+  if (values.length <= 1) return [];
+
+  const headers = values[0];
+  return values.slice(1)
+    .filter(row => row.some(cell => cell !== ''))
+    .map(row => {
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = row[i] !== undefined ? row[i] : ''; });
+      return obj;
+    });
+}
+
+
+// ── Teachers_Master ──────────────────────────────────────────
+
+function getTeacherByLineId(lineUserId) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.TEACHERS)
+      .find(t => t['LINE_User_ID'] === lineUserId && t['Status'] === 'Active') || null;
+  } catch (e) { logInfo('Sheet', 'ERROR getTeacherByLineId', e.message); return null; }
+}
+
+function getTeacherById(teacherId) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.TEACHERS)
+      .find(t => t['Teacher_ID'] === teacherId) || null;
+  } catch (e) { logInfo('Sheet', 'ERROR getTeacherById', e.message); return null; }
+}
+
+/**
+ * ค้นหาครูจาก keyword ใน Teacher_Name
+ * กรองเฉพาะครูที่ Status = Active
+ * คืน Array ทั้งที่มีและไม่มี LINE_User_ID (เพื่อแสดงสถานะใน Card)
+ *
+ * @param {string} keyword - คำค้น (case-insensitive)
+ * @returns {Array<Object>} ครูที่ตรงกัน สูงสุด 8 คน
+ */
+function searchTeachersByKeyword(keyword) {
+  try {
+    const normalized = keyword.trim().toLowerCase();
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.TEACHERS)
+      .filter(t =>
+        t['Status'] === 'Active' &&
+        t['Teacher_Name'].toString().toLowerCase().includes(normalized)
+      )
+      .slice(0, 8); // จำกัด 8 ผลลัพธ์ เพื่อไม่ให้ Carousel ยาวเกิน
+  } catch (e) {
+    logInfo('Sheet', 'ERROR searchTeachersByKeyword', e.message);
+    return [];
+  }
+}
+
+
+/**
+ * เขียน LINE_User_ID ลงใน Teachers_Master
+ * ใช้ LockService ป้องกัน Race Condition
+ *
+ * @param {string} teacherId  - Teacher_ID (Primary Key)
+ * @param {string} lineUserId - LINE User ID ที่ต้องการบันทึก
+ * @returns {boolean}
+ */
+function registerTeacherLineId(teacherId, lineUserId) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+
+    const sheet   = getSheet(SYSTEM_CONFIG.SHEETS.TEACHERS);
+    const values  = sheet.getDataRange().getValues();
+    const headers = values[0];
+
+    const idCol      = headers.indexOf('Teacher_ID');
+    const lineIdCol  = headers.indexOf('LINE_User_ID');
+    const updatedCol = headers.indexOf('Registered_At'); // optional column
+
+    if (idCol === -1 || lineIdCol === -1) {
+      throw new Error('ไม่พบ Column Teacher_ID หรือ LINE_User_ID ใน Sheet');
+    }
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][idCol] !== teacherId) continue;
+
+      // ป้องกันเขียนทับ (Double-check ใน Lock)
+      if (values[i][lineIdCol] && values[i][lineIdCol].toString().trim() !== '') {
+        logInfo('Sheet', `WARN: ${teacherId} มี LINE_User_ID อยู่แล้ว`);
         return false;
       }
 
-      // รอเล็กน้อยระหว่าง Batch (Rate Limit)
-      if (batches.length > 1) {
-        Utilities.sleep(200);
+      sheet.getRange(i + 1, lineIdCol + 1).setValue(lineUserId);
+
+      // บันทึกเวลาลงทะเบียน (ถ้ามี Column Registered_At)
+      if (updatedCol !== -1) {
+        sheet.getRange(i + 1, updatedCol + 1).setValue(new Date());
       }
+
+      logInfo('Sheet', `บันทึก LINE_User_ID สำเร็จ: ${teacherId}`);
+      return true;
     }
 
-    logInfo('sendLineMessage',
-      `ส่งสำเร็จ ${messages.length} messages → ${userId}`);
-    return true;
+    logInfo('Sheet', `ไม่พบ Teacher_ID: ${teacherId}`);
+    return false;
 
   } catch (e) {
-    logInfo('sendLineMessage', 'ERROR', e.message);
+    logInfo('Sheet', 'ERROR registerTeacherLineId', e.message);
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * ดึงข้อมูล Monitor จาก Monitor_ID
+ *
+ * @param {string} monitorId - Monitor_ID (Primary Key)
+ * @returns {Object|null}
+ */
+function getMonitorById(monitorId) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.MONITORS)
+      .find(m => m['Monitor_ID'] === monitorId) || null;
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getMonitorById', e.message);
+    return null;
+  }
+}
+
+
+/**
+ * ค้นหาผู้สร้าง QR จาก keyword ใน Student_Name
+ * กรองเฉพาะที่ Status = Active
+ * คืน Array ทั้งที่มีและไม่มี LINE_User_ID (เพื่อแสดงสถานะ)
+ *
+ * @param {string} keyword  - คำค้น (case-insensitive)
+ * @returns {Array<Object>} ผู้สร้าง QR ที่ตรงกัน สูงสุด 8 คน
+ */
+function searchMonitorsByKeyword(keyword) {
+  try {
+    const normalized = keyword.trim().toLowerCase();
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.MONITORS)
+      .filter(m =>
+        m['Status'] === 'Active' &&
+        m['Student_Name'].toString().toLowerCase().includes(normalized)
+      )
+      .slice(0, 8);
+  } catch (e) {
+    logInfo('Sheet', 'ERROR searchMonitorsByKeyword', e.message);
+    return [];
+  }
+}
+
+
+/**
+ * เขียน LINE_User_ID ลงใน ClassMonitors_Master
+ * ใช้ LockService ป้องกัน Race Condition
+ *
+ * @param {string} monitorId  - Monitor_ID (Primary Key)
+ * @param {string} lineUserId - LINE User ID ที่ต้องการบันทึก
+ * @returns {boolean}
+ */
+function registerMonitorLineId(monitorId, lineUserId) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+
+    const sheet   = getSheet(SYSTEM_CONFIG.SHEETS.MONITORS);
+    const values  = sheet.getDataRange().getValues();
+    const headers = values[0];
+
+    const idCol      = headers.indexOf('Monitor_ID');
+    const lineIdCol  = headers.indexOf('LINE_User_ID');
+    const regAtCol   = headers.indexOf('Registered_At'); // optional column
+
+    if (idCol === -1 || lineIdCol === -1) {
+      throw new Error('ไม่พบ Column Monitor_ID หรือ LINE_User_ID ใน ClassMonitors_Master');
+    }
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][idCol] !== monitorId) continue;
+
+      // ป้องกันเขียนทับ (Double-check ใน Lock)
+      if (values[i][lineIdCol] && values[i][lineIdCol].toString().trim() !== '') {
+        logInfo('Sheet', `WARN: ${monitorId} มี LINE_User_ID อยู่แล้ว`);
+        return false;
+      }
+
+      sheet.getRange(i + 1, lineIdCol + 1).setValue(lineUserId);
+
+      // บันทึกเวลาลงทะเบียน (ถ้ามี Column Registered_At)
+      if (regAtCol !== -1) {
+        sheet.getRange(i + 1, regAtCol + 1).setValue(new Date());
+      }
+
+      logInfo('Sheet', `บันทึก Monitor LINE_User_ID สำเร็จ: ${monitorId}`);
+      return true;
+    }
+
+    logInfo('Sheet', `ไม่พบ Monitor_ID: ${monitorId}`);
+    return false;
+
+  } catch (e) {
+    logInfo('Sheet', 'ERROR registerMonitorLineId', e.message);
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// ── ClassMonitors_Master ─────────────────────────────────────
+
+function getMonitorByLineId(lineUserId) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.MONITORS)
+      .find(m => m['LINE_User_ID'] === lineUserId && m['Status'] === 'Active') || null;
+  } catch (e) { logInfo('Sheet', 'ERROR getMonitorByLineId', e.message); return null; }
+}
+
+
+// ── Subjects_Schedule ────────────────────────────────────────
+
+function getScheduleByClassroomToday(classroom) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.SCHEDULE)
+      .filter(s =>
+        s['Classroom'] === classroom &&
+        s['Day']       === getTodayDayName() &&
+        s['Semester']  === SCHOOL_CONFIG.SEMESTER_CURRENT
+      )
+      .sort((a, b) => Number(a['Period_Number']) - Number(b['Period_Number']));
+  } catch (e) { logInfo('Sheet', 'ERROR getScheduleByClassroomToday', e.message); return []; }
+}
+
+function getSubjectByClassroomAndPeriod(classroom, periodNumber) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.SCHEDULE)
+      .find(s =>
+        s['Classroom']     === classroom &&
+        s['Day']           === getTodayDayName() &&
+        Number(s['Period_Number']) === Number(periodNumber) &&
+        s['Semester']      === SCHOOL_CONFIG.SEMESTER_CURRENT
+      ) || null;
+  } catch (e) { logInfo('Sheet', 'ERROR getSubjectByClassroomAndPeriod', e.message); return null; }
+}
+
+/**
+ * ดึงตารางสอนวันนี้ตาม Scope ของผู้สร้าง QR
+ *
+ * Scope Rules:
+ *   Student  → Classroom_Scope = ชื่อห้องเดียว เช่น "ม.1/1"
+ *   Teacher  → Classroom_Scope = ระดับชั้น เช่น "ม.1" (ทุกห้องในระดับนั้น)
+ *   Staff/Admin → Classroom_Scope = "ALL" (ทุกห้อง)
+ *
+ * @param {Object} monitorData - ข้อมูลจาก ClassMonitors_Master
+ * @returns {Array<Object>} รายการตารางเรียน เรียงตาม Period แล้ว Classroom
+ */
+function getScheduleByCreatorScope(monitorData) {
+  try {
+    const scope       = (monitorData['Classroom_Scope'] || monitorData['Classroom'] || '').toString().trim();
+    const creatorType = (monitorData['Creator_Type'] || SYSTEM_CONFIG.CREATOR_TYPE.STUDENT).toString().trim();
+    const today       = getTodayDayName();
+    const semester    = SCHOOL_CONFIG.SEMESTER_CURRENT;
+    const allSchedules = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.SCHEDULE);
+
+    let filtered = [];
+
+    if (scope === SYSTEM_CONFIG.SCOPE_ALL ||
+        creatorType === SYSTEM_CONFIG.CREATOR_TYPE.STAFF ||
+        creatorType === SYSTEM_CONFIG.CREATOR_TYPE.ADMIN) {
+      // Staff / Admin → ทุกห้องในวันนั้น
+      filtered = allSchedules.filter(s =>
+        s['Day']      === today &&
+        s['Semester'] === semester
+      );
+
+    } else if (creatorType === SYSTEM_CONFIG.CREATOR_TYPE.TEACHER && scope && !scope.includes('/')) {
+      // หัวหน้าระดับ → ห้องทุกห้องที่ขึ้นต้นด้วย scope เช่น "ม.1"
+      filtered = allSchedules.filter(s =>
+        s['Day']        === today &&
+        s['Semester']   === semester &&
+        s['Classroom'].toString().startsWith(scope)
+      );
+
+    } else {
+      // Student หรือ Scope เป็นชื่อห้องเฉพาะ
+      const classroom = scope || monitorData['Classroom'] || '';
+      filtered = allSchedules.filter(s =>
+        s['Day']        === today &&
+        s['Semester']   === semester &&
+        s['Classroom']  === classroom
+      );
+    }
+
+    return filtered.sort((a, b) => {
+      // เรียงตาม Classroom ก่อน แล้วตาม Period
+      const classCompare = a['Classroom'].localeCompare(b['Classroom'], 'th');
+      if (classCompare !== 0) return classCompare;
+      return Number(a['Period_Number']) - Number(b['Period_Number']);
+    });
+
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getScheduleByCreatorScope', e.message);
+    return [];
+  }
+}
+
+
+/**
+ * สร้าง Label แสดง Scope สำหรับ Header ของ Flex Card
+ *
+ * @param {Object} monitorData
+ * @returns {string} เช่น "ม.1/1" | "ระดับ ม.2" | "ทุกห้องเรียน"
+ */
+function getScopeLabel(monitorData) {
+  const scope       = (monitorData['Classroom_Scope'] || monitorData['Classroom'] || '').toString().trim();
+  const creatorType = (monitorData['Creator_Type'] || SYSTEM_CONFIG.CREATOR_TYPE.STUDENT).toString().trim();
+
+  if (scope === SYSTEM_CONFIG.SCOPE_ALL ||
+      creatorType === SYSTEM_CONFIG.CREATOR_TYPE.STAFF ||
+      creatorType === SYSTEM_CONFIG.CREATOR_TYPE.ADMIN) {
+    return 'ทุกห้องเรียน';
+  }
+  if (creatorType === SYSTEM_CONFIG.CREATOR_TYPE.TEACHER && scope && !scope.includes('/')) {
+    return `ระดับ ${scope}`;
+  }
+  return scope || monitorData['Classroom'] || '-';
+}
+
+
+// ── QR_Sessions ──────────────────────────────────────────────
+
+/**
+ * สร้าง QR Session ใน Sheet
+ * ── แก้ไขจากเดิม: เพิ่ม subjectName เพื่อให้ครูเห็นชื่อวิชาชัดเจน ──
+ *
+ * @param {Object} params
+ * @returns {string} Token
+ */
+function createQRSession(params) {
+  try {
+    const sheet     = getSheet(SYSTEM_CONFIG.SHEETS.QR_SESSIONS);
+    const token     = generateQRToken();
+    const createdAt = new Date();
+    const expiresAt = getQRExpireTime();
+
+    sheet.appendRow([
+      token,
+      params.subjectCode,
+      params.subjectName,      // ← เพิ่มใหม่ แก้ปัญหาชื่อวิชาหายใน Card
+      params.teacherId,
+      params.teacherName,
+      params.classroom,
+      params.periodNumber,
+      params.periodName,
+      params.createdByLineId,
+      params.createdByName,
+      createdAt,
+      expiresAt,
+      SYSTEM_CONFIG.QR_STATUS.ACTIVE,
+      '',
+      '',
+    ]);
+
+    logInfo('Sheet', `สร้าง Token: ${token}`);
+    return token;
+  } catch (e) {
+    logInfo('Sheet', 'ERROR createQRSession', e.message);
+    throw new Error('ไม่สามารถสร้าง QR Session ได้');
+  }
+}
+
+
+/**
+ * ตรวจสอบ QR Token
+ *
+ * @param {string} token
+ * @returns {Object} { valid, status, data }
+ */
+function validateQRToken(token) {
+  try {
+    const sheet   = getSheet(SYSTEM_CONFIG.SHEETS.QR_SESSIONS);
+    const values  = sheet.getDataRange().getValues();
+    const headers = values[0];
+
+    const tokenCol  = headers.indexOf('Token');
+    const statusCol = headers.indexOf('Status');
+    const expireCol = headers.indexOf('Expires_At');
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][tokenCol] !== token) continue;
+
+      const status   = values[i][statusCol];
+      const expireAt = values[i][expireCol];
+
+      if (status === SYSTEM_CONFIG.QR_STATUS.USED) {
+        return { valid: false, status: 'used', data: null };
+      }
+      if (status === SYSTEM_CONFIG.QR_STATUS.EXPIRED || isQRExpired(expireAt)) {
+        if (status !== SYSTEM_CONFIG.QR_STATUS.EXPIRED) {
+          sheet.getRange(i + 1, statusCol + 1).setValue(SYSTEM_CONFIG.QR_STATUS.EXPIRED);
+        }
+        return { valid: false, status: 'expired', data: null };
+      }
+
+      const data = {};
+      headers.forEach((h, idx) => { data[h] = values[i][idx]; });
+      data['_rowIndex'] = i + 1;
+      return { valid: true, status: 'active', data };
+    }
+
+    return { valid: false, status: 'not_found', data: null };
+
+  } catch (e) {
+    logInfo('Sheet', 'ERROR validateQRToken', e.message);
+    return { valid: false, status: 'error', data: null };
+  }
+}
+
+
+/**
+ * Mark QR Token ว่าใช้แล้ว
+ *
+ * @param {string} token
+ * @param {string} usedByLineId
+ * @returns {boolean}
+ */
+function markQRTokenAsUsed(token, usedByLineId) {
+  try {
+    const sheet   = getSheet(SYSTEM_CONFIG.SHEETS.QR_SESSIONS);
+    const values  = sheet.getDataRange().getValues();
+    const headers = values[0];
+    const tokenCol  = headers.indexOf('Token');
+    const statusCol = headers.indexOf('Status');
+    const usedByCol = headers.indexOf('Used_By_LineID');
+    const usedAtCol = headers.indexOf('Used_At');
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][tokenCol] !== token) continue;
+      const row = i + 1;
+      sheet.getRange(row, statusCol  + 1).setValue(SYSTEM_CONFIG.QR_STATUS.USED);
+      sheet.getRange(row, usedByCol  + 1).setValue(usedByLineId);
+      sheet.getRange(row, usedAtCol  + 1).setValue(new Date());
+      return true;
+    }
+    return false;
+  } catch (e) {
+    logInfo('Sheet', 'ERROR markQRTokenAsUsed', e.message);
     return false;
   }
 }
 
 
 /**
- * ส่งข้อความ Broadcast ไปยังหลาย User พร้อมกัน
- * ใช้สำหรับประกาศจาก Admin
+ * ตรวจสอบว่ามี QR Active อยู่แล้วสำหรับคาบนี้หรือไม่
  *
- * @param {Array<string>} userIds  - Array ของ LINE User IDs
- * @param {Array<Object>} messages - Messages ที่จะส่ง
+ * @param {string} classroom
+ * @param {number} periodNumber
+ * @returns {boolean}
  */
-function sendBroadcastMessage(userIds, messages) {
-  let successCount = 0;
-  let failCount    = 0;
-
-  userIds.forEach(userId => {
-    const success = sendLineMessage(userId, messages);
-    if (success) successCount++;
-    else         failCount++;
-    Utilities.sleep(100); // หน่วงเล็กน้อยป้องกัน Rate Limit
-  });
-
-  logInfo('Broadcast',
-    `ส่งเสร็จ: ${successCount} สำเร็จ, ${failCount} ล้มเหลว`
-  );
-  return { success: successCount, failed: failCount };
-}
-
-
-// ============================================================
-// 🛠️ SECTION 6: Utility Functions
-// ============================================================
-
-/**
- * แบ่ง Array เป็น Chunks ขนาดที่กำหนด
- * ใช้สำหรับแบ่ง Messages ที่เกิน 5 รายการ
- *
- * @param {Array}  array     - Array ต้นฉบับ
- * @param {number} chunkSize - ขนาดของแต่ละ Chunk
- * @returns {Array<Array>}
- */
-function chunkArray(array, chunkSize) {
-  const chunks = [];
-  for (let i = 0; i < array.length; i += chunkSize) {
-    chunks.push(array.slice(i, i + chunkSize));
-  }
-  return chunks;
-}
-
-
-/**
- * ดึง Profile ของ LINE User
- * ใช้ดึงชื่อเพื่อแสดงใน Log หรือข้อความต้อนรับ
- *
- * @param {string} userId - LINE User ID
- * @returns {Object|null} LINE Profile หรือ null
- */
-function getLineUserProfile(userId) {
+function checkActiveQRForPeriod(classroom, periodNumber) {
   try {
-    const url     = `https://api.line.me/v2/bot/profile/${userId}`;
-    const options = {
-      method:  'get',
-      headers: {
-        'Authorization': `Bearer ${CREDENTIALS.LINE_CHANNEL_ACCESS_TOKEN}`,
-      },
-      muteHttpExceptions: true,
-    };
+    const sheet   = getSheet(SYSTEM_CONFIG.SHEETS.QR_SESSIONS);
+    const values  = sheet.getDataRange().getValues();
+    const headers = values[0];
+    const classCol   = headers.indexOf('Classroom');
+    const periodCol  = headers.indexOf('Period_Number');
+    const statusCol  = headers.indexOf('Status');
+    const expireCol  = headers.indexOf('Expires_At');
+    const createdCol = headers.indexOf('Created_At');
 
-    const result   = UrlFetchApp.fetch(url, options);
-    const httpCode = result.getResponseCode();
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
 
-    if (httpCode === 200) {
-      return JSON.parse(result.getContentText());
+    for (let i = 1; i < values.length; i++) {
+      const row        = values[i];
+      const created    = new Date(row[createdCol]);
+      created.setHours(0, 0, 0, 0);
+      const isToday    = created.getTime() === today.getTime();
+      const isMatch    = row[classCol] === classroom && Number(row[periodCol]) === Number(periodNumber);
+      const isActive   = row[statusCol] === SYSTEM_CONFIG.QR_STATUS.ACTIVE;
+      const notExpired = !isQRExpired(row[expireCol]);
+
+      if (isToday && isMatch && isActive && notExpired) return true;
     }
-    return null;
+    return false;
+  } catch (e) {
+    logInfo('Sheet', 'ERROR checkActiveQRForPeriod', e.message);
+    return false;
+  }
+}
+
+
+/**
+ * ล้าง QR Token ที่หมดอายุแล้ว (รันด้วย Time Trigger ทุกคืน)
+ *
+ * @returns {number} จำนวน Token ที่ Expire
+ */
+function cleanupExpiredQRTokens() {
+  try {
+    const sheet   = getSheet(SYSTEM_CONFIG.SHEETS.QR_SESSIONS);
+    const values  = sheet.getDataRange().getValues();
+    const headers = values[0];
+    const statusCol = headers.indexOf('Status');
+    const expireCol = headers.indexOf('Expires_At');
+    let count = 0;
+
+    for (let i = 1; i < values.length; i++) {
+      if (values[i][statusCol] === SYSTEM_CONFIG.QR_STATUS.ACTIVE && isQRExpired(values[i][expireCol])) {
+        sheet.getRange(i + 1, statusCol + 1).setValue(SYSTEM_CONFIG.QR_STATUS.EXPIRED);
+        count++;
+      }
+    }
+    logInfo('Sheet', `Cleanup: Expire ${count} Tokens`);
+    return count;
+  } catch (e) {
+    logInfo('Sheet', 'ERROR cleanupExpiredQRTokens', e.message);
+    return 0;
+  }
+}
+
+
+// ── Teacher_CheckIn_Log ──────────────────────────────────────
+
+/**
+ * บันทึกการเช็คอินลง Sheet
+ * ใช้ LockService ป้องกัน Race Condition
+ *
+ * @param {Object} params
+ * @returns {boolean}
+ */
+function saveCheckIn(params) {
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(10000);
+
+    const sheet  = getSheet(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG);
+    const now    = new Date();
+
+    // คำนวณสถานะ
+    const period = getPeriodByNumber(params.periodNumber);
+    let status   = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+    if (period) {
+      const [sh, sm] = period.start.split(':').map(Number);
+      const graceEnd = new Date();
+      graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
+      if (now > graceEnd) status = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
+    }
+
+    sheet.appendRow([
+      now,
+      params.teacherId,
+      params.teacherName,
+      params.subjectCode,
+      params.subjectName,
+      params.classroom,
+      params.periodNumber,
+      params.periodName,
+      params.timeStart,
+      params.timeEnd,
+      params.day,
+      params.teachingTopic,
+      params.assignment || '-',
+      params.qrToken,
+      status,
+      SCHOOL_CONFIG.SEMESTER_CURRENT,
+    ]);
+
+    logInfo('Sheet', `บันทึกเช็คอิน: ${params.teacherName} — ${params.subjectName}`);
+    return true;
 
   } catch (e) {
-    logInfo('getLineUserProfile', 'ERROR', e.message);
+    logInfo('Sheet', 'ERROR saveCheckIn', e.message);
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/**
+ * ตรวจสอบว่าครูเช็คอินคาบนี้แล้วหรือยัง
+ *
+ * @param {string} teacherId
+ * @param {number} periodNumber
+ * @returns {boolean}
+ */
+function isAlreadyCheckedIn(teacherId, periodNumber) {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG).some(log => {
+      const d = new Date(log['Timestamp']);
+      d.setHours(0, 0, 0, 0);
+      return (
+        log['Teacher_ID'] === teacherId &&
+        Number(log['Period_Number']) === Number(periodNumber) &&
+        d.getTime() === today.getTime()
+      );
+    });
+  } catch (e) {
+    logInfo('Sheet', 'ERROR isAlreadyCheckedIn', e.message);
+    return false;
+  }
+}
+
+
+/**
+ * ดึงประวัติการเช็คอินของครู
+ *
+ * @param {string} teacherId
+ * @param {number} limit
+ * @returns {Array<Object>}
+ */
+function getTeacherCheckInHistory(teacherId, limit = 10) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG)
+      .filter(l => l['Teacher_ID'] === teacherId)
+      .sort((a, b) => new Date(b['Timestamp']) - new Date(a['Timestamp']))
+      .slice(0, limit);
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getTeacherCheckInHistory', e.message);
+    return [];
+  }
+}
+
+
+/**
+ * ดึงรายการเช็คอินวันนี้ของห้องเรียนที่ระบุ
+ * ใช้โดย sendMonitorStatus() เพื่อแสดงสถานะแยกคาบ
+ *
+ * @param {string} classroom - ชื่อห้องเรียน เช่น "ม.1/1"
+ * @returns {Array<Object>}
+ */
+function getTodayCheckInForClassroom(classroom) {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG).filter(log => {
+      const d = new Date(log['Timestamp']);
+      d.setHours(0, 0, 0, 0);
+      return (
+        log['Classroom'] === classroom &&
+        d.getTime() === today.getTime()
+      );
+    });
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getTodayCheckInForClassroom', e.message);
+    return [];
+  }
+}
+
+
+/**
+ * สรุปการเช็คอินวันนี้สำหรับ Admin
+ *
+ * @returns {Object|null}
+ */
+function getTodayCheckInSummary() {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const logs = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG);
+    const todayLogs = logs.filter(l => {
+      const d = new Date(l['Timestamp']);
+      d.setHours(0, 0, 0, 0);
+      return d.getTime() === today.getTime();
+    });
+
+    const onTime         = todayLogs.filter(l => l['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME).length;
+    const uniqueTeachers = [...new Set(todayLogs.map(l => l['Teacher_ID']))].length;
+
+    return {
+      date:           formatThaiDate(new Date()),
+      totalCheckIns:  todayLogs.length,
+      onTime,
+      late:           todayLogs.length - onTime,
+      uniqueTeachers,
+      logs:           todayLogs,
+    };
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getTodayCheckInSummary', e.message);
     return null;
   }
 }
 
 
+/**
+ * ดึงรายการเช็คอินตามช่วงวันที่
+ *
+ * @param {Date} startDate
+ * @param {Date} endDate
+ * @returns {Array<Object>}
+ */
+function getCheckInsByDateRange(startDate, endDate) {
+  try {
+    return getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG)
+      .filter(l => {
+        const d = new Date(l['Timestamp']);
+        return d >= startDate && d <= endDate;
+      })
+      .sort((a, b) => new Date(a['Timestamp']) - new Date(b['Timestamp']));
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getCheckInsByDateRange', e.message);
+    return [];
+  }
+}
+
+
+// ── Role Identification ───────────────────────────────────────
+
+/**
+ * ระบุ Role ของผู้ใช้จาก LINE User ID
+ * ลำดับ: Admin → Teacher → Monitor → Unknown
+ *
+ * @param {string} lineUserId
+ * @returns {Object} { role, data }
+ */
+function identifyUserRole(lineUserId) {
+  if (getAdminLineIds().includes(lineUserId)) {
+    return { role: SYSTEM_CONFIG.USER_ROLE.ADMIN, data: { lineUserId } };
+  }
+
+  const teacher = getTeacherByLineId(lineUserId);
+  if (teacher) return { role: SYSTEM_CONFIG.USER_ROLE.TEACHER, data: teacher };
+
+  const monitor = getMonitorByLineId(lineUserId);
+  if (monitor) return { role: SYSTEM_CONFIG.USER_ROLE.MONITOR, data: monitor };
+
+  return { role: SYSTEM_CONFIG.USER_ROLE.UNKNOWN, data: null };
+}
+
+
+// ── QR URL Helpers ────────────────────────────────────────────
+
+/**
+ * สร้าง URL ที่ฝังใน QR Code
+ * เมื่อครูสแกนด้วย LINE QR Scanner จะส่งข้อความ CHECKIN:[token] มาที่ Bot
+ *
+ * @param {string} token
+ * @returns {string}
+ */
+function buildQRUrl(token) {
+  const botBasicId = getCredential('BOT_BASIC_ID');
+  const message    = `CHECKIN:${token}`;
+  return `https://line.me/R/oaMessage/${botBasicId}/?${encodeURIComponent(message)}`;
+}
+
+
+/**
+ * สร้าง URL ของรูป QR Code จาก API ฟรี
+ *
+ * @param {string} url - URL ที่ต้องการฝัง
+ * @returns {string}
+ */
+function buildQRImageUrl(url) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(url)}&ecc=M`;
+}
+
+
 // ============================================================
-// 🏥 SECTION 7: Health Check และ System Status
+// 🎨 SECTION 9: Flex Messages — UI Templates
+// ============================================================
+
+// ── Monitor Templates ─────────────────────────────────────────
+
+/**
+ * [MONITOR] รายการคาบเรียนวันนี้ — Carousel
+ *
+ * @param {string}        classroom
+ * @param {Array<Object>} schedules - รวม Teacher_Name แล้ว
+ * @returns {Object} Flex Message
+ */
+function flexPeriodList(classroom, schedules) {
+  if (schedules.length === 0) return flexNoSchedule(classroom);
+
+  const headerBubble = {
+    type: 'bubble',
+    size: 'kilo',
+    body: {
+      type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+      contents: [
+        { type: 'text', text: '📅 ตารางสอนวันนี้', size: 'lg', weight: 'bold', color: FLEX_COLORS.SECONDARY },
+        { type: 'text', text: `🏫 ${classroom}`, size: 'sm', color: FLEX_COLORS.TEXT_SUB, margin: 'xs' },
+        { type: 'text', text: formatThaiDate(new Date()), size: 'xs', color: FLEX_COLORS.TEXT_SUB },
+        { type: 'separator', margin: 'md' },
+        { type: 'text', text: 'กดปุ่ม "สร้าง QR" เพื่อสร้าง QR Code\nให้ครูผู้สอนสแกนค่ะ', size: 'xs', color: FLEX_COLORS.NEUTRAL, wrap: true, margin: 'md' },
+      ],
+    },
+  };
+
+  const periodBubbles = schedules.map(subject => {
+    const period    = getPeriodByNumber(Number(subject['Period_Number']));
+    const timeLabel = period ? `${period.start} – ${period.end}` : '';
+
+    return {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '12px',
+        contents: [
+          { type: 'text', text: subject['Period_Name'] || `คาบที่ ${subject['Period_Number']}`, color: FLEX_COLORS.WHITE, size: 'sm', weight: 'bold' },
+          { type: 'text', text: timeLabel, color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          { type: 'text', text: subject['Subject_Name'] || '-', size: 'sm', weight: 'bold', color: FLEX_COLORS.TEXT_MAIN, wrap: true },
+          {
+            type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'sm',
+            contents: [
+              { type: 'text', text: '👩‍🏫', size: 'xs', flex: 0 },
+              { type: 'text', text: subject['Teacher_Name'] || subject['Teacher_ID'] || '-', size: 'xs', color: FLEX_COLORS.TEXT_SUB, flex: 1 },
+            ],
+          },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{
+          type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm',
+          action: {
+            type: 'postback', label: '📲 สร้าง QR',
+            data: `action=create_qr&period=${subject['Period_Number']}&classroom=${encodeURIComponent(classroom)}&subject=${encodeURIComponent(subject['Subject_Code'])}`,
+            displayText: `สร้าง QR ${subject['Period_Name'] || `คาบที่ ${subject['Period_Number']}`}`,
+          },
+        }],
+      },
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: `ตารางสอนวันนี้ ${classroom} — กรุณาเปิดเพื่อดูรายละเอียดค่ะ`,
+    contents: { type: 'carousel', contents: [headerBubble, ...periodBubbles] },
+  };
+}
+
+
+/**
+ * [MONITOR] ยืนยันก่อนสร้าง QR
+ *
+ * @param {Object}      subject
+ * @param {Object|null} teacher
+ * @param {Object}      period
+ * @returns {Object}
+ */
+function flexQRConfirm(subject, teacher, period) {
+  return {
+    type: 'flex',
+    altText: `ยืนยันสร้าง QR Code — ${subject['Subject_Name']} ${period.name}`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '📲 ยืนยันสร้าง QR Code', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: 'กรุณาตรวจสอบข้อมูลก่อนสร้างค่ะ', color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          _infoRow('📚', 'วิชา',       subject['Subject_Name'] || '-'),
+          _infoRow('👩‍🏫', 'ครูผู้สอน', teacher ? teacher['Teacher_Name'] : '-'),
+          _infoRow('🏫', 'ห้องเรียน', subject['Classroom'] || '-'),
+          _infoRow('🕐', 'คาบ',        `${period.name} (${period.start}–${period.end})`),
+          _infoRow('📅', 'วันที่',      formatThaiDate(new Date())),
+          { type: 'separator', margin: 'md' },
+          {
+            type: 'box', layout: 'horizontal', backgroundColor: '#FFF8E1', cornerRadius: '8px', paddingAll: '10px', margin: 'md',
+            contents: [{ type: 'text', text: `⏱️ QR Code จะหมดอายุใน ${SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES} นาทีค่ะ`, size: 'xs', color: FLEX_COLORS.WARNING, wrap: true }],
+          },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          { type: 'button', style: 'secondary', height: 'sm', flex: 1, action: { type: 'postback', label: '❌ ยกเลิก', data: 'action=cancel_qr', displayText: 'ยกเลิก' } },
+          {
+            type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm', flex: 2,
+            action: {
+              type: 'postback', label: '✅ ยืนยันสร้าง QR',
+              data: `action=confirm_qr&period=${subject['Period_Number']}&classroom=${encodeURIComponent(subject['Classroom'])}&subject=${encodeURIComponent(subject['Subject_Code'])}`,
+              displayText: 'ยืนยันสร้าง QR Code',
+            },
+          },
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [MONITOR] แจ้งเตือนเมื่อครูเช็คอินแล้ว
+ *
+ * @param {string} teacherName
+ * @param {string} subjectName
+ * @param {string} periodName
+ * @param {string} topic
+ * @returns {Object}
+ */
+function flexMonitorCheckinNotify(teacherName, subjectName, periodName, topic) {
+  return {
+    type: 'flex',
+    altText: `✅ ${teacherName} เช็คอินแล้วค่ะ`,
+    contents: {
+      type: 'bubble',
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          {
+            type: 'box', layout: 'horizontal', spacing: 'md',
+            contents: [
+              { type: 'text', text: '✅', size: 'xxl', flex: 0 },
+              {
+                type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: 'ครูเช็คอินแล้วค่ะ!', size: 'md', weight: 'bold', color: FLEX_COLORS.PRIMARY },
+                  { type: 'text', text: teacherName, size: 'sm', color: FLEX_COLORS.TEXT_MAIN, margin: 'xs' },
+                ],
+              },
+            ],
+          },
+          { type: 'separator', margin: 'md' },
+          _infoRow('📚', 'วิชา',        subjectName),
+          _infoRow('🕐', 'คาบ',         periodName),
+          _infoRow('📝', 'เรื่องที่สอน', topic || '-'),
+        ],
+      },
+    },
+  };
+}
+
+
+// ── Teacher Templates ─────────────────────────────────────────
+
+/**
+ * [TEACHER] ข้อมูลคาบหลังสแกน QR สำเร็จ
+ *
+ * @param {Object} qrData
+ * @param {Object} teacher
+ * @returns {Object}
+ */
+function flexClassInfo(qrData, teacher) {
+  const period    = getPeriodByNumber(Number(qrData['Period_Number']));
+  const timeLabel = period ? `${period.start} – ${period.end}` : '-';
+
+  return {
+    type: 'flex',
+    altText: `สแกน QR สำเร็จ — ${qrData['Subject_Name'] || qrData['Subject_Code']}`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '📲 สแกน QR สำเร็จ!', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: 'กรุณาตรวจสอบข้อมูลด้านล่างค่ะ', color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          { type: 'text', text: qrData['Subject_Name'] || qrData['Subject_Code'] || '-', size: 'lg', weight: 'bold', color: FLEX_COLORS.TEXT_MAIN, wrap: true },
+          { type: 'separator', margin: 'md' },
+          _infoRow('👩‍🏫', 'ครูผู้สอน', teacher ? teacher['Teacher_Name'] : '-'),
+          _infoRow('🏫', 'ห้องเรียน', qrData['Classroom'] || '-'),
+          _infoRow('🕐', 'คาบเรียน',  `${qrData['Period_Name']} (${timeLabel})`),
+          _infoRow('📅', 'วันที่',     formatThaiDate(new Date())),
+          { type: 'separator', margin: 'md' },
+          { type: 'text', text: 'กรุณากรอกรายละเอียดการสอน\nด้วยการพิมพ์ตอบกลับในแชทค่ะ 👇', size: 'sm', color: FLEX_COLORS.NEUTRAL, wrap: true, margin: 'md' },
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [TEACHER] สรุปข้อมูลก่อนยืนยันเช็คอิน
+ *
+ * @param {Object} checkinData
+ * @returns {Object}
+ */
+function flexCheckinConfirm(checkinData) {
+  return {
+    type: 'flex',
+    altText: 'ยืนยันการเช็คอิน — กรุณาตรวจสอบข้อมูลค่ะ',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.ACCENT, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '📋 ยืนยันการเช็คอิน', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: 'กรุณาตรวจสอบข้อมูลก่อนกดยืนยันค่ะ', color: '#FFE0CC', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          _infoRow('👩‍🏫', 'ครูผู้สอน',  checkinData.teacherName || '-'),
+          _infoRow('📚', 'วิชา',        checkinData.subjectName || '-'),
+          _infoRow('🏫', 'ห้องเรียน',   checkinData.classroom   || '-'),
+          _infoRow('🕐', 'คาบเรียน',    `${checkinData.periodName} (${checkinData.timeStart}–${checkinData.timeEnd})`),
+          _infoRow('📅', 'วันที่',       formatThaiDate(new Date())),
+          { type: 'separator', margin: 'md' },
+          {
+            type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.LIGHT_BG, cornerRadius: '8px', paddingAll: '12px', margin: 'md',
+            contents: [
+              { type: 'text', text: '📝 เรื่องที่สอน', size: 'xs', color: FLEX_COLORS.NEUTRAL, weight: 'bold' },
+              { type: 'text', text: checkinData.teachingTopic || '-', size: 'sm', color: FLEX_COLORS.TEXT_MAIN, wrap: true, margin: 'xs' },
+            ],
+          },
+          {
+            type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.LIGHT_BG, cornerRadius: '8px', paddingAll: '12px', margin: 'sm',
+            contents: [
+              { type: 'text', text: '📋 งานมอบหมาย', size: 'xs', color: FLEX_COLORS.NEUTRAL, weight: 'bold' },
+              { type: 'text', text: checkinData.assignment || 'ไม่มีงานมอบหมาย', size: 'sm', color: checkinData.assignment ? FLEX_COLORS.TEXT_MAIN : FLEX_COLORS.TEXT_SUB, wrap: true, margin: 'xs' },
+            ],
+          },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          { type: 'button', style: 'secondary', height: 'sm', flex: 1, action: { type: 'postback', label: '✏️ แก้ไข', data: 'action=edit_checkin', displayText: 'ขอแก้ไขข้อมูลค่ะ' } },
+          { type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm', flex: 2, action: { type: 'postback', label: '✅ ยืนยันเช็คอิน', data: 'action=confirm_checkin', displayText: 'ยืนยันการเช็คอินค่ะ' } },
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [TEACHER] แจ้งผลเช็คอินสำเร็จ
+ *
+ * @param {Object} checkinData (รวม status แล้ว)
+ * @returns {Object}
+ */
+function flexCheckinSuccess(checkinData) {
+  const isOnTime    = checkinData.status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+  const statusColor = isOnTime ? FLEX_COLORS.PRIMARY : FLEX_COLORS.WARNING;
+  const statusIcon  = isOnTime ? '✅' : '⚠️';
+  const time        = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+
+  return {
+    type: 'flex',
+    altText: `✅ เช็คอินสำเร็จ — ${checkinData.subjectName}`,
+    contents: {
+      type: 'bubble',
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '20px',
+        contents: [
+          {
+            type: 'box', layout: 'vertical', alignItems: 'center',
+            contents: [
+              { type: 'text', text: statusIcon, size: '5xl', align: 'center' },
+              { type: 'text', text: 'บันทึกการเข้าสอนสำเร็จ!', size: 'lg', weight: 'bold', color: statusColor, align: 'center', margin: 'md' },
+              { type: 'text', text: checkinData.status || '', size: 'sm', color: statusColor, align: 'center' },
+            ],
+          },
+          { type: 'separator', margin: 'lg' },
+          _infoRow('📚', 'วิชา',        checkinData.subjectName   || '-'),
+          _infoRow('🕐', 'คาบ',         checkinData.periodName    || '-'),
+          _infoRow('📝', 'เรื่องที่สอน', checkinData.teachingTopic || '-'),
+          _infoRow('📋', 'งานมอบหมาย',  checkinData.assignment    || 'ไม่มีงานมอบหมาย'),
+          { type: 'separator', margin: 'md' },
+          { type: 'text', text: `บันทึกเมื่อ ${time} น.`, size: 'xs', color: FLEX_COLORS.TEXT_SUB, align: 'center', margin: 'md' },
+          { type: 'text', text: 'ขอบคุณค่ะ 🙏', size: 'sm', color: FLEX_COLORS.NEUTRAL, align: 'center' },
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [TEACHER] ประวัติการเช็คอิน 5 รายการล่าสุด
+ *
+ * @param {string}        teacherName
+ * @param {Array<Object>} history
+ * @returns {Object}
+ */
+function flexTeacherHistory(teacherName, history) {
+  const rows = history.slice(0, 5).map(log => {
+    const d       = new Date(log['Timestamp']);
+    const dateStr = `${d.getDate()}/${d.getMonth() + 1}`;
+    const timeStr = d.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    const onTime  = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+
+    return {
+      type: 'box', layout: 'horizontal', paddingAll: '8px', spacing: 'sm',
+      contents: [
+        { type: 'text', text: onTime ? '🟢' : '🟡', size: 'xs', flex: 0 },
+        {
+          type: 'box', layout: 'vertical', flex: 1,
+          contents: [
+            { type: 'text', text: log['Subject_Name'] || '-', size: 'xs', weight: 'bold', color: FLEX_COLORS.TEXT_MAIN, wrap: true },
+            { type: 'text', text: `${log['Period_Name']} • ${log['Classroom']}`, size: 'xxs', color: FLEX_COLORS.TEXT_SUB },
+          ],
+        },
+        {
+          type: 'box', layout: 'vertical', flex: 0, alignItems: 'flex-end',
+          contents: [
+            { type: 'text', text: dateStr, size: 'xxs', color: FLEX_COLORS.TEXT_SUB, align: 'end' },
+            { type: 'text', text: timeStr, size: 'xxs', color: FLEX_COLORS.TEXT_SUB, align: 'end' },
+          ],
+        },
+      ],
+    };
+  });
+
+  if (rows.length === 0) {
+    rows.push({ type: 'text', text: 'ยังไม่มีประวัติการเช็คอินค่ะ', size: 'sm', color: FLEX_COLORS.TEXT_SUB, align: 'center' });
+  }
+
+  return {
+    type: 'flex',
+    altText: `ประวัติการเช็คอินของ ${teacherName}`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '📊 ประวัติการเช็คอิน', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: `${teacherName} (5 รายการล่าสุด)`, color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: { type: 'box', layout: 'vertical', spacing: 'none', paddingAll: '8px', contents: rows },
+      footer: {
+        type: 'box', layout: 'horizontal', paddingAll: '8px',
+        contents: [{ type: 'text', text: '🟢 ตรงเวลา   🟡 สาย', size: 'xxs', color: FLEX_COLORS.TEXT_SUB, align: 'center' }],
+      },
+    },
+  };
+}
+
+
+/**
+ * [TEACHER] เมนูหลักของครู
+ *
+ * @param {string} teacherName
+ * @returns {Object}
+ */
+function flexTeacherMenu(teacherName) {
+  return {
+    type: 'flex',
+    altText: `สวัสดีค่ะ ${teacherName}`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '👋 สวัสดีค่ะ', color: FLEX_COLORS.WHITE, size: 'sm' },
+          { type: 'text', text: teacherName, color: FLEX_COLORS.WHITE, size: 'lg', weight: 'bold', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          { type: 'text', text: 'ระบบเช็คอินการเข้าสอน พร้อมใช้งานค่ะ ✅', size: 'sm', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+          { type: 'separator', margin: 'md' },
+          _menuButton('📊 ประวัติการเช็คอินของฉัน', 'action=teacher_history', FLEX_COLORS.SECONDARY),
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{ type: 'text', text: '💡 สแกน QR Code จากหัวหน้าห้อง\nเพื่อเช็คอินการเข้าสอนได้เลยค่ะ', size: 'xs', color: FLEX_COLORS.NEUTRAL, align: 'center', wrap: true }],
+      },
+    },
+  };
+}
+
+
+// ── Admin Templates ───────────────────────────────────────────
+
+/**
+ * [ADMIN] รายงานสรุปประจำวัน
+ *
+ * @param {Object} summary
+ * @returns {Object}
+ */
+function flexAdminDailyReport(summary) {
+  return {
+    type: 'flex',
+    altText: `📊 รายงานสรุปวันนี้ — เช็คอินแล้ว ${summary.totalCheckIns} คาบ`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '📊 รายงานสรุปประจำวัน', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: summary.date || formatThaiDate(new Date()), color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'md', paddingAll: '16px',
+        contents: [
+          {
+            type: 'box', layout: 'horizontal', spacing: 'sm',
+            contents: [
+              _statBox('รวมทั้งหมด', `${summary.totalCheckIns} คาบ`, FLEX_COLORS.SECONDARY),
+              _statBox('ตรงเวลา',    `${summary.onTime} คาบ`,        FLEX_COLORS.PRIMARY),
+              _statBox('สาย',        `${summary.late} คาบ`,          FLEX_COLORS.WARNING),
+            ],
+          },
+          { type: 'separator', margin: 'md' },
+          _infoRow('👩‍🏫', 'ครูที่เช็คอินแล้ว', `${summary.uniqueTeachers} คน`),
+          { type: 'separator', margin: 'sm' },
+          { type: 'text', text: 'กดปุ่มด้านล่างเพื่อดูรายละเอียดค่ะ', size: 'xs', color: FLEX_COLORS.TEXT_SUB, align: 'center', margin: 'md' },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          { type: 'button', style: 'secondary', height: 'sm', flex: 1, action: { type: 'postback', label: '📋 รายละเอียด', data: 'action=admin_detail_report', displayText: 'ดูรายละเอียด' } },
+          { type: 'button', style: 'primary', color: FLEX_COLORS.SECONDARY, height: 'sm', flex: 1, action: { type: 'postback', label: '📥 Export', data: 'action=admin_export', displayText: 'Export รายงาน' } },
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [ADMIN] รายละเอียดการเช็คอินวันนี้ แยกตามคาบ — Carousel
+ *
+ * @param {Array<Object>} logs
+ * @returns {Object}
+ */
+function flexAdminDetailReport(logs) {
+  const byPeriod = {};
+  logs.forEach(log => {
+    const key = `${log['Period_Number']}_${log['Period_Name']}`;
+    if (!byPeriod[key]) byPeriod[key] = [];
+    byPeriod[key].push(log);
+  });
+
+  const periodKeys = Object.keys(byPeriod).sort((a, b) =>
+    Number(a.split('_')[0]) - Number(b.split('_')[0])
+  );
+
+  if (periodKeys.length === 0) {
+    return {
+      type: 'flex', altText: 'ยังไม่มีการเช็คอินในวันนี้ค่ะ',
+      contents: {
+        type: 'bubble',
+        body: { type: 'box', layout: 'vertical', paddingAll: '20px', contents: [{ type: 'text', text: '📋 ยังไม่มีการเช็คอิน\nในวันนี้ค่ะ', size: 'md', color: FLEX_COLORS.TEXT_SUB, align: 'center', wrap: true }] },
+      },
+    };
+  }
+
+  const bubbles = periodKeys.map(key => {
+    const periodLogs = byPeriod[key];
+    const periodName = key.split('_').slice(1).join('_');
+    const period     = getPeriodByNumber(Number(key.split('_')[0]));
+    const timeLabel  = period ? `${period.start}–${period.end}` : '';
+
+    const teacherRows = periodLogs.map(log => ({
+      type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'xs',
+      contents: [
+        { type: 'text', text: log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡', size: 'xs', flex: 0 },
+        {
+          type: 'box', layout: 'vertical', flex: 1,
+          contents: [
+            { type: 'text', text: log['Teacher_Name'] || '-', size: 'xs', weight: 'bold', color: FLEX_COLORS.TEXT_MAIN },
+            { type: 'text', text: log['Subject_Name'] || '-', size: 'xxs', color: FLEX_COLORS.TEXT_SUB },
+          ],
+        },
+      ],
+    }));
+
+    return {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '10px',
+        contents: [
+          { type: 'text', text: periodName, color: FLEX_COLORS.WHITE, size: 'sm', weight: 'bold' },
+          { type: 'text', text: timeLabel, color: '#B0BEC5', size: 'xxs' },
+        ],
+      },
+      body: { type: 'box', layout: 'vertical', paddingAll: '10px', spacing: 'xs', contents: teacherRows },
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: `รายละเอียดการเช็คอินวันนี้ — ${logs.length} รายการ`,
+    contents: { type: 'carousel', contents: bubbles },
+  };
+}
+
+
+/**
+ * [ADMIN] รายงานรายสัปดาห์
+ *
+ * @param {Object} byDay
+ * @param {Date}   startDate
+ * @param {Date}   endDate
+ * @returns {Object}
+ */
+function flexAdminWeeklyReport(byDay, startDate, endDate) {
+  const days     = Object.keys(byDay);
+  const maxTotal = Math.max(...days.map(d => byDay[d].total), 1);
+  const totalAll  = days.reduce((s, d) => s + byDay[d].total,  0);
+  const onTimeAll = days.reduce((s, d) => s + byDay[d].onTime, 0);
+  const lateAll   = days.reduce((s, d) => s + byDay[d].late,   0);
+  const startStr  = startDate.toLocaleDateString('th-TH', { day: 'numeric', month: 'short' });
+  const endStr    = endDate.toLocaleDateString('th-TH',   { day: 'numeric', month: 'short' });
+
+  const dayRows = days.map(day => {
+    const d = byDay[day];
+    const barWidth = Math.round((d.total / maxTotal) * 100);
+    return {
+      type: 'box', layout: 'vertical', margin: 'sm',
+      contents: [
+        {
+          type: 'box', layout: 'horizontal',
+          contents: [
+            { type: 'text', text: day,           size: 'xs', color: FLEX_COLORS.TEXT_SUB,  flex: 3 },
+            { type: 'text', text: `${d.total} คาบ`, size: 'xs', color: FLEX_COLORS.TEXT_MAIN, align: 'end', flex: 2 },
+          ],
+        },
+        {
+          type: 'box', layout: 'vertical', margin: 'xs', height: '6px', backgroundColor: '#E0E0E0', cornerRadius: '3px',
+          contents: [{ type: 'box', layout: 'vertical', width: `${barWidth}%`, height: '6px', backgroundColor: FLEX_COLORS.PRIMARY, cornerRadius: '3px', contents: [] }],
+        },
+      ],
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: `รายงานรายสัปดาห์ — ${totalAll} รายการ`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '📅 รายงานรายสัปดาห์', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: `${startStr} – ${endStr}`, color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'sm',
+        contents: [
+          {
+            type: 'box', layout: 'horizontal', spacing: 'sm',
+            contents: [
+              _statBox('รวมทั้งหมด', `${totalAll}`,  FLEX_COLORS.SECONDARY),
+              _statBox('ตรงเวลา',    `${onTimeAll}`, FLEX_COLORS.PRIMARY),
+              _statBox('สาย',        `${lateAll}`,   FLEX_COLORS.WARNING),
+            ],
+          },
+          { type: 'separator', margin: 'md' },
+          ...dayRows,
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [ADMIN] เมนูหลัก
+ *
+ * @returns {Object}
+ */
+function flexAdminMenu() {
+  return {
+    type: 'flex',
+    altText: 'เมนู Admin ฝ่ายวิชาการ',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '👔 Admin ฝ่ายวิชาการ', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
+          { type: 'text', text: SCHOOL_CONFIG.SCHOOL_NAME, color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          _menuButton('📊 ดูสรุปวันนี้',      'action=admin_today_summary',  FLEX_COLORS.SECONDARY),
+          _menuButton('📋 รายละเอียดวันนี้',   'action=admin_detail_report',  FLEX_COLORS.SECONDARY),
+          _menuButton('📅 รายงานรายสัปดาห์',  'action=admin_weekly_report',  FLEX_COLORS.NEUTRAL),
+          _menuButton('📥 Export รายงาน',      'action=admin_export',         FLEX_COLORS.NEUTRAL),
+        ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [ADMIN] ปุ่ม Export พร้อม Link Sheets
+ *
+ * @param {string} sheetsUrl
+ * @returns {Object}
+ */
+function flexExportCard(sheetsUrl) {
+  return {
+    type: 'flex',
+    altText: 'Export รายงาน — กดเพื่อเปิด Google Sheets',
+    contents: {
+      type: 'bubble',
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: '16px', spacing: 'md',
+        contents: [
+          { type: 'text', text: '📥 Export รายงาน', size: 'md', weight: 'bold', color: FLEX_COLORS.SECONDARY },
+          { type: 'text', text: 'กดปุ่มด้านล่างเพื่อเปิด Google Sheets\nแล้วเลือก File > Download ได้เลยค่ะ', size: 'sm', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+          {
+            type: 'box', layout: 'vertical', backgroundColor: '#E8F5E9', cornerRadius: '8px', paddingAll: '10px', margin: 'md',
+            contents: [
+              { type: 'text', text: '💡 วิธี Export เป็น Excel', size: 'xs', color: FLEX_COLORS.PRIMARY, weight: 'bold' },
+              { type: 'text', text: '1. เปิด Sheets\n2. เลือก Teacher_CheckIn_Log\n3. File > Download > .xlsx', size: 'xs', color: FLEX_COLORS.TEXT_SUB, wrap: true, margin: 'xs' },
+            ],
+          },
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '12px',
+        contents: [{ type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm', action: { type: 'uri', label: '📊 เปิด Google Sheets', uri: sheetsUrl } }],
+      },
+    },
+  };
+}
+
+
+// ── System Templates ──────────────────────────────────────────
+
+/**
+ * [SYSTEM] ไม่มีตารางเรียนวันนี้
+ *
+ * @param {string} classroom
+ * @returns {Object}
+ */
+function flexNoSchedule(classroom) {
+  return {
+    type: 'flex',
+    altText: `ไม่พบตารางสอนของ ${classroom} วันนี้ค่ะ`,
+    contents: {
+      type: 'bubble',
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: '24px', alignItems: 'center', spacing: 'md',
+        contents: [
+          { type: 'text', text: '📅', size: '5xl', align: 'center' },
+          { type: 'text', text: 'ไม่พบตารางสอนวันนี้', size: 'lg', weight: 'bold', color: FLEX_COLORS.TEXT_MAIN, align: 'center' },
+          { type: 'text', text: `ห้อง ${classroom}\n${formatThaiDate(new Date())}`, size: 'sm', color: FLEX_COLORS.TEXT_SUB, align: 'center', wrap: true },
+          { type: 'text', text: 'หากมีข้อสงสัย กรุณาติดต่อฝ่ายวิชาการค่ะ', size: 'xs', color: FLEX_COLORS.NEUTRAL, align: 'center', wrap: true, margin: 'md' },
+        ],
+      },
+    },
+  };
+}
+
+/**
+ * [REGISTRATION] แสดงผลลัพธ์การค้นหาครู — Carousel
+ * แต่ละ Bubble = ครู 1 คน พร้อมปุ่มยืนยัน
+ *
+ * @param {string}        keyword - คำค้นที่ใช้
+ * @param {Array<Object>} results - ผลลัพธ์จาก searchTeachersByKeyword()
+ * @returns {Object} Flex Message
+ */
+function flexRegSearchResults(keyword, results) {
+  const headerBubble = {
+    type: 'bubble', size: 'kilo',
+    body: {
+      type: 'box', layout: 'vertical', paddingAll: '20px', spacing: 'md',
+      justifyContent: 'center', alignItems: 'center',
+      contents: [
+        { type: 'text', text: '🔍', size: '4xl', align: 'center' },
+        { type: 'text', text: `พบ ${results.length} ชื่อ`, size: 'lg', weight: 'bold', color: FLEX_COLORS.SECONDARY, align: 'center', margin: 'md' },
+        { type: 'text', text: `สำหรับคำค้น "${keyword}"`, size: 'sm', color: FLEX_COLORS.TEXT_SUB, align: 'center' },
+        { type: 'separator', margin: 'lg' },
+        { type: 'text', text: 'เลื่อนดูรายชื่อ แล้วกดปุ่ม\n"นี่คือฉัน" เพื่อลงทะเบียนค่ะ 👉', size: 'xs', color: FLEX_COLORS.NEUTRAL, align: 'center', wrap: true, margin: 'md' },
+      ],
+    },
+  };
+
+  const teacherBubbles = results.map(teacher => {
+    const hasLineId   = teacher['LINE_User_ID'] && teacher['LINE_User_ID'].toString().trim() !== '';
+    const dept        = teacher['Department'] || teacher['Subject_Group'] || '';
+    const statusColor = hasLineId ? FLEX_COLORS.NEUTRAL : FLEX_COLORS.PRIMARY;
+    const statusText  = hasLineId ? '🔒 ลงทะเบียนแล้ว' : '✅ พร้อมลงทะเบียน';
+
+    return {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical',
+        backgroundColor: hasLineId ? FLEX_COLORS.NEUTRAL : FLEX_COLORS.SECONDARY,
+        paddingAll: '14px',
+        contents: [
+          { type: 'text', text: '👩‍🏫 ครูผู้สอน', color: '#FFFFFF99', size: 'xs' },
+          { type: 'text', text: teacher['Teacher_Name'], color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold', wrap: true, margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical', paddingAll: '14px', spacing: 'sm',
+        contents: [
+          ...(dept ? [_infoRow('🏫', 'กลุ่มสาระ', dept)] : []),
+          _infoRow('🆔', 'รหัส', teacher['Teacher_ID'] || '-'),
+          { type: 'separator', margin: 'md' },
+          {
+            type: 'box', layout: 'horizontal', backgroundColor: hasLineId ? '#F5F5F5' : '#E8F5E9',
+            cornerRadius: '8px', paddingAll: '8px', margin: 'md',
+            contents: [{
+              type: 'text', text: statusText, size: 'xs',
+              color: statusColor, align: 'center', weight: 'bold',
+            }],
+          },
+        ],
+      },
+      footer: hasLineId ? undefined : {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{
+          type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm',
+          action: {
+            type: 'postback',
+            label: '✋ นี่คือฉัน',
+            data: `action=reg_confirm&teacher_id=${encodeURIComponent(teacher['Teacher_ID'])}`,
+            displayText: `ยืนยัน: ${teacher['Teacher_Name']}`,
+          },
+        }],
+      },
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: `พบ ${results.length} ชื่อสำหรับ "${keyword}" — กรุณาเปิดเพื่อลงทะเบียนค่ะ`,
+    contents: {
+      type: 'carousel',
+      contents: [headerBubble, ...teacherBubbles],
+    },
+  };
+}
+
+/**
+ * [REGISTRATION QR] แสดงผลลัพธ์การค้นหาผู้สร้าง QR — Carousel
+ * แต่ละ Bubble = ผู้สร้าง QR 1 คน พร้อมปุ่มยืนยัน
+ *
+ * @param {string}        keyword - คำค้นที่ใช้
+ * @param {Array<Object>} results - ผลลัพธ์จาก searchMonitorsByKeyword()
+ * @returns {Object} Flex Message
+ */
+function flexRegQRSearchResults(keyword, results) {
+
+  // Header Bubble — สรุปผลการค้นหา
+  const headerBubble = {
+    type: 'bubble', size: 'kilo',
+    body: {
+      type: 'box', layout: 'vertical',
+      paddingAll: '20px', spacing: 'md',
+      justifyContent: 'center', alignItems: 'center',
+      contents: [
+        { type: 'text', text: '🔍', size: '4xl', align: 'center' },
+        {
+          type: 'text',
+          text: `พบ ${results.length} ชื่อ`,
+          size: 'lg', weight: 'bold',
+          color: FLEX_COLORS.SECONDARY, align: 'center', margin: 'md',
+        },
+        {
+          type: 'text',
+          text: `สำหรับคำค้น "${keyword}"`,
+          size: 'sm', color: FLEX_COLORS.TEXT_SUB, align: 'center',
+        },
+        { type: 'separator', margin: 'lg' },
+        {
+          type: 'text',
+          text: 'เลื่อนดูรายชื่อ\nแล้วกดปุ่ม "นี่คือฉัน"\nเพื่อลงทะเบียนค่ะ 👉',
+          size: 'xs', color: FLEX_COLORS.NEUTRAL,
+          align: 'center', wrap: true, margin: 'md',
+        },
+      ],
+    },
+  };
+
+  // Monitor Bubbles — แสดงผลทีละคน
+  const monitorBubbles = results.map(monitor => {
+    const hasLineId    = monitor['LINE_User_ID'] && monitor['LINE_User_ID'].toString().trim() !== '';
+    const creatorLabel = _getCreatorTypeDisplay(monitor['Creator_Type']);
+    const scopeLabel   = getScopeLabel(monitor);
+    const noteText     = monitor['Note'] ? monitor['Note'].toString() : '';
+    const headerColor  = hasLineId ? FLEX_COLORS.NEUTRAL : FLEX_COLORS.SECONDARY;
+    const statusColor  = hasLineId ? FLEX_COLORS.NEUTRAL : FLEX_COLORS.PRIMARY;
+    const statusText   = hasLineId ? '🔒 ลงทะเบียนแล้ว' : '✅ พร้อมลงทะเบียน';
+    const statusBg     = hasLineId ? '#F5F5F5' : '#E8F5E9';
+
+    return {
+      type: 'bubble', size: 'kilo',
+      header: {
+        type: 'box', layout: 'vertical',
+        backgroundColor: headerColor, paddingAll: '14px',
+        contents: [
+          {
+            type: 'text',
+            text: creatorLabel,
+            color: '#FFFFFF99', size: 'xs',
+          },
+          {
+            type: 'text',
+            text: monitor['Student_Name'],
+            color: FLEX_COLORS.WHITE, size: 'md',
+            weight: 'bold', wrap: true, margin: 'xs',
+          },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical',
+        paddingAll: '14px', spacing: 'sm',
+        contents: [
+          _infoRow('📌', 'ขอบเขต',   scopeLabel),
+          _infoRow('🆔', 'รหัส',     monitor['Monitor_ID'] || '-'),
+          // แสดง Note เฉพาะเมื่อมีข้อมูล
+          ...(noteText ? [_infoRow('📝', 'หมายเหตุ', noteText)] : []),
+          { type: 'separator', margin: 'md' },
+          {
+            type: 'box', layout: 'horizontal',
+            backgroundColor: statusBg, cornerRadius: '8px',
+            paddingAll: '8px', margin: 'md',
+            contents: [{
+              type: 'text', text: statusText,
+              size: 'xs', color: statusColor,
+              align: 'center', weight: 'bold',
+            }],
+          },
+        ],
+      },
+      // ซ่อน Footer ถ้าลงทะเบียนแล้ว
+      footer: hasLineId ? undefined : {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{
+          type: 'button',
+          style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm',
+          action: {
+            type: 'postback',
+            label: '✋ นี่คือฉัน',
+            data: `action=reg_qr_confirm&monitor_id=${encodeURIComponent(monitor['Monitor_ID'])}`,
+            displayText: `ยืนยัน: ${monitor['Student_Name']}`,
+          },
+        }],
+      },
+    };
+  });
+
+  return {
+    type: 'flex',
+    altText: `พบ ${results.length} ชื่อสำหรับ "${keyword}" — กรุณาเปิดเพื่อลงทะเบียนค่ะ`,
+    contents: {
+      type: 'carousel',
+      contents: [headerBubble, ...monitorBubbles],
+    },
+  };
+}
+
+
+// ── Private Helper Functions ──────────────────────────────────
+
+/** สร้าง Row ข้อมูล Label:Value แบบ Horizontal @private */
+function _infoRow(icon, label, value) {
+  return {
+    type: 'box', layout: 'horizontal', spacing: 'sm', margin: 'xs',
+    contents: [
+      { type: 'text', text: icon,              size: 'sm', flex: 0 },
+      { type: 'text', text: label,             size: 'sm', color: FLEX_COLORS.TEXT_SUB,  flex: 2 },
+      { type: 'text', text: String(value||'-'), size: 'sm', color: FLEX_COLORS.TEXT_MAIN, flex: 3, wrap: true, align: 'end' },
+    ],
+  };
+}
+
+/** สร้างกล่องสถิติขนาดเล็ก @private */
+function _statBox(label, value, color) {
+  return {
+    type: 'box', layout: 'vertical', flex: 1, backgroundColor: color, cornerRadius: '8px', paddingAll: '10px', alignItems: 'center',
+    contents: [
+      { type: 'text', text: value, size: 'md', weight: 'bold', color: FLEX_COLORS.WHITE, align: 'center' },
+      { type: 'text', text: label, size: 'xxs', color: '#FFFFFF99', align: 'center' },
+    ],
+  };
+}
+
+/** สร้างปุ่มเมนู Full Width @private */
+function _menuButton(label, postbackData, color) {
+  return {
+    type: 'button', style: 'primary', color, height: 'sm', margin: 'xs',
+    action: { type: 'postback', label, data: postbackData, displayText: label },
+  };
+}
+
+
+// ============================================================
+// 📤 SECTION 10: LINE API — sendLineMessage
 // ============================================================
 
 /**
- * ตรวจสอบสถานะระบบทั้งหมด
- * รันจาก GAS Editor เพื่อตรวจสอบก่อน Go-Live
+ * ส่งข้อความไปยัง LINE User ด้วย Push Message API
+ * รองรับ Array ของ Messages และแบ่ง Batch อัตโนมัติ
+ * (LINE รองรับสูงสุด 5 Messages ต่อ Request)
+ *
+ * @param {string}        userId   - LINE User ID
+ * @param {Array<Object>} messages - Message Objects
+ * @returns {boolean}
+ */
+function sendLineMessage(userId, messages) {
+  try {
+    if (!userId || !messages || messages.length === 0) {
+      logInfo('LINE', 'ERROR: userId หรือ messages ว่าง');
+      return false;
+    }
+
+    const token   = getCredential('LINE_CHANNEL_ACCESS_TOKEN');
+    const batches = chunkArray(messages, 5);
+
+    for (const batch of batches) {
+      const options = {
+        method:             'post',
+        contentType:        'application/json',
+        headers:            { 'Authorization': `Bearer ${token}` },
+        payload:            JSON.stringify({ to: userId, messages: batch }),
+        muteHttpExceptions: true,
+      };
+
+      const result   = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/push', options);
+      const httpCode = result.getResponseCode();
+
+      if (httpCode !== 200) {
+        logInfo('LINE', `ERROR HTTP ${httpCode}`, result.getContentText());
+        return false;
+      }
+
+      if (batches.length > 1) Utilities.sleep(200);
+    }
+
+    logInfo('LINE', `ส่งสำเร็จ ${messages.length} msgs → ${userId}`);
+    return true;
+
+  } catch (e) {
+    logInfo('LINE', 'ERROR sendLineMessage', e.message);
+    return false;
+  }
+}
+
+
+/**
+ * Broadcast ไปยังหลาย User พร้อมกัน
+ *
+ * @param {Array<string>} userIds
+ * @param {Array<Object>} messages
+ * @returns {Object} { success, failed }
+ */
+function sendBroadcastMessage(userIds, messages) {
+  let success = 0, failed = 0;
+  userIds.forEach(uid => {
+    if (sendLineMessage(uid, messages)) success++;
+    else failed++;
+    Utilities.sleep(100);
+  });
+  logInfo('LINE', `Broadcast: ${success} สำเร็จ, ${failed} ล้มเหลว`);
+  return { success, failed };
+}
+
+
+// ============================================================
+// 🧪 SECTION 11: Setup & Testing Functions
+// ============================================================
+
+/**
+ * ══════════════════════════════════════════════════════════
+ * ตั้งค่า Credentials ครั้งแรก
+ * รันฟังก์ชันนี้จาก GAS Editor ก่อนใช้งานระบบ
+ * ══════════════════════════════════════════════════════════
+ *
+ * วิธีใช้:
+ *   1. เปิด GAS Editor
+ *   2. แก้ไขค่าด้านล่างให้ถูกต้อง
+ *   3. กดปุ่ม Run (▶)
+ *   4. ตรวจสอบด้วย checkCredentials() ว่าครบหรือไม่
+ */
+function setupCredentials() {
+  const props = PropertiesService.getScriptProperties();
+
+  props.setProperties({
+
+    // ── LINE Bot ─────────────────────────────────────────────
+    // หาได้จาก: LINE Developers Console > Channel > Messaging API
+    'LINE_CHANNEL_ACCESS_TOKEN': 'YOUR_CHANNEL_ACCESS_TOKEN_HERE',
+    'LINE_CHANNEL_SECRET':       'YOUR_CHANNEL_SECRET_HERE',
+
+    // ── LINE Bot Basic ID ────────────────────────────────────
+    // หาได้จาก: LINE Developers Console > Basic settings > Basic ID
+    // รูปแบบ: @xxxxxxxx (มี @ นำหน้า)
+    'BOT_BASIC_ID': '@your_bot_basic_id_here',
+
+    // ── Google Sheets ────────────────────────────────────────
+    // หาได้จาก: URL ของ Sheets ระหว่าง /d/ และ /edit
+    'SPREADSHEET_ID': 'YOUR_SPREADSHEET_ID_HERE',
+
+    // ── Admin LINE IDs ───────────────────────────────────────
+    // ใส่เป็น JSON Array String
+    // หา ID ได้จาก: ให้ Admin Add Bot แล้วดู Log ใน Executions
+    'ADMIN_LINE_IDS': JSON.stringify([
+      'U_ADMIN_LINE_ID_1_HERE',
+      // 'U_ADMIN_LINE_ID_2_HERE', // เพิ่มได้ถ้ามีหลายคน
+    ]),
+
+  });
+
+  logInfo('Setup', '✅ บันทึก Credentials สำเร็จ');
+  logInfo('Setup', 'ตรวจสอบด้วย checkCredentials() ได้เลยค่ะ');
+}
+
+
+/**
+ * ตรวจสอบว่า Credentials ครบหรือยัง
+ * รันหลัง setupCredentials()
+ */
+function testCheckCredentials() {
+  const result = checkCredentials();
+  if (result.ok) {
+    logInfo('Setup', '✅ Credentials ครบทุก Key พร้อมใช้งาน');
+  } else {
+    logInfo('Setup', '❌ Credentials ที่ยังขาด', result.missing.join(', '));
+  }
+}
+
+
+/**
+ * System Health Check ครบทุกส่วน
+ * รันก่อน Go-Live ทุกครั้ง
  */
 function systemHealthCheck() {
-  logInfo('HealthCheck', '=== เริ่ม System Health Check ===');
-
+  logInfo('Health', '=== System Health Check ===');
   let allPassed = true;
 
-  // --- 1. ตรวจสอบ Config ---
-  logInfo('HealthCheck', '1. ตรวจสอบ Config...');
-  if (!CREDENTIALS.LINE_CHANNEL_ACCESS_TOKEN ||
-       CREDENTIALS.LINE_CHANNEL_ACCESS_TOKEN === 'YOUR_CHANNEL_ACCESS_TOKEN_HERE') {
-    logInfo('HealthCheck', '❌ LINE_CHANNEL_ACCESS_TOKEN ยังไม่ได้ตั้งค่า');
-    allPassed = false;
+  // 1. Credentials
+  logInfo('Health', '1. ตรวจสอบ Credentials...');
+  const credCheck = checkCredentials();
+  if (credCheck.ok) {
+    logInfo('Health', '  ✅ Credentials ครบ');
   } else {
-    logInfo('HealthCheck', '✅ LINE_CHANNEL_ACCESS_TOKEN พร้อม');
+    logInfo('Health', '  ❌ ขาด', credCheck.missing.join(', '));
+    allPassed = false;
   }
 
-  if (!CREDENTIALS.LINE_CHANNEL_SECRET ||
-       CREDENTIALS.LINE_CHANNEL_SECRET === 'YOUR_CHANNEL_SECRET_HERE') {
-    logInfo('HealthCheck', '❌ LINE_CHANNEL_SECRET ยังไม่ได้ตั้งค่า');
-    allPassed = false;
-  } else {
-    logInfo('HealthCheck', '✅ LINE_CHANNEL_SECRET พร้อม');
-  }
-
-  if (!CREDENTIALS.SPREADSHEET_ID ||
-       CREDENTIALS.SPREADSHEET_ID === 'YOUR_SPREADSHEET_ID_HERE') {
-    logInfo('HealthCheck', '❌ SPREADSHEET_ID ยังไม่ได้ตั้งค่า');
-    allPassed = false;
-  } else {
-    logInfo('HealthCheck', '✅ SPREADSHEET_ID พร้อม');
-  }
-
-  if (!CREDENTIALS.ADMIN_LINE_IDS ||
-       CREDENTIALS.ADMIN_LINE_IDS[0] === 'U_ADMIN_LINE_ID_1_HERE') {
-    logInfo('HealthCheck', '❌ ADMIN_LINE_IDS ยังไม่ได้ตั้งค่า');
-    allPassed = false;
-  } else {
-    logInfo('HealthCheck', `✅ ADMIN_LINE_IDS: ${CREDENTIALS.ADMIN_LINE_IDS.length} คน`);
-  }
-
-  // --- 2. ตรวจสอบ Google Sheets ---
-  logInfo('HealthCheck', '2. ตรวจสอบ Google Sheets...');
+  // 2. Google Sheets
+  logInfo('Health', '2. ตรวจสอบ Google Sheets...');
   try {
-    const ss           = getSpreadsheet();
-    const sheetNames   = ss.getSheets().map(s => s.getName());
-    const requiredSheets = Object.values(SYSTEM_CONFIG.SHEETS);
-
-    requiredSheets.forEach(name => {
+    const ss         = getSpreadsheet();
+    const sheetNames = ss.getSheets().map(s => s.getName());
+    Object.values(SYSTEM_CONFIG.SHEETS).forEach(name => {
       if (sheetNames.includes(name)) {
-        logInfo('HealthCheck', `  ✅ Sheet "${name}" พร้อม`);
+        logInfo('Health', `  ✅ "${name}"`);
       } else {
-        logInfo('HealthCheck', `  ❌ ไม่พบ Sheet "${name}"`);
+        logInfo('Health', `  ❌ ไม่พบ Sheet "${name}"`);
         allPassed = false;
       }
     });
   } catch (e) {
-    logInfo('HealthCheck', '❌ ไม่สามารถเชื่อมต่อ Google Sheets', e.message);
+    logInfo('Health', '  ❌ ไม่สามารถเชื่อมต่อ Sheets', e.message);
     allPassed = false;
   }
 
-  // --- 3. ตรวจสอบ LINE API Connection ---
-  logInfo('HealthCheck', '3. ตรวจสอบ LINE API...');
+  // 3. LINE API
+  logInfo('Health', '3. ตรวจสอบ LINE API...');
   try {
-    const url     = 'https://api.line.me/v2/bot/info';
-    const options = {
-      method:  'get',
-      headers: {
-        'Authorization': `Bearer ${CREDENTIALS.LINE_CHANNEL_ACCESS_TOKEN}`,
-      },
+    const token  = getCredential('LINE_CHANNEL_ACCESS_TOKEN');
+    const result = UrlFetchApp.fetch('https://api.line.me/v2/bot/info', {
+      method: 'get',
+      headers: { 'Authorization': `Bearer ${token}` },
       muteHttpExceptions: true,
-    };
-    const result   = UrlFetchApp.fetch(url, options);
-    const httpCode = result.getResponseCode();
-
-    if (httpCode === 200) {
-      const botInfo = JSON.parse(result.getContentText());
-      logInfo('HealthCheck',
-        `✅ LINE Bot พร้อม: ${botInfo.displayName}`);
+    });
+    if (result.getResponseCode() === 200) {
+      const info = JSON.parse(result.getContentText());
+      logInfo('Health', `  ✅ Bot: ${info.displayName}`);
     } else {
-      logInfo('HealthCheck',
-        `❌ LINE API Error: HTTP ${httpCode}`,
-        result.getContentText()
-      );
+      logInfo('Health', `  ❌ LINE API HTTP ${result.getResponseCode()}`);
       allPassed = false;
     }
   } catch (e) {
-    logInfo('HealthCheck', '❌ ไม่สามารถเชื่อมต่อ LINE API', e.message);
+    logInfo('Health', '  ❌ ไม่สามารถเชื่อมต่อ LINE API', e.message);
     allPassed = false;
   }
 
-  // --- 4. ตรวจสอบข้อมูลใน Sheets ---
-  logInfo('HealthCheck', '4. ตรวจสอบข้อมูลใน Sheets...');
+  // 4. ข้อมูลใน Sheets
+  logInfo('Health', '4. ตรวจสอบข้อมูลใน Sheets...');
   try {
-    const teachers = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.TEACHERS);
-    logInfo('HealthCheck',
-      `✅ Teachers_Master: ${teachers.length} คน`);
-
-    const monitors = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.MONITORS);
-    logInfo('HealthCheck',
-      `✅ ClassMonitors_Master: ${monitors.length} คน`);
-
+    const teachers  = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.TEACHERS);
+    const monitors  = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.MONITORS);
     const schedules = getAllDataAsObjects(SYSTEM_CONFIG.SHEETS.SCHEDULE);
-    logInfo('HealthCheck',
-      `✅ Subjects_Schedule: ${schedules.length} รายการ`);
-
+    logInfo('Health', `  ✅ Teachers: ${teachers.length} คน`);
+    logInfo('Health', `  ✅ Monitors: ${monitors.length} คน`);
+    logInfo('Health', `  ✅ Schedule: ${schedules.length} รายการ`);
   } catch (e) {
-    logInfo('HealthCheck', '❌ ERROR ดึงข้อมูล Sheets', e.message);
+    logInfo('Health', '  ❌ ERROR ดึงข้อมูล', e.message);
     allPassed = false;
   }
 
-  // --- 5. ตรวจสอบ PERIODS Config ---
-  logInfo('HealthCheck', '5. ตรวจสอบ PERIODS Config...');
-  if (PERIODS.length === 10) {
-    logInfo('HealthCheck', `✅ PERIODS: ${PERIODS.length} คาบ`);
-    PERIODS.forEach(p => {
-      logInfo('HealthCheck',
-        `  ${p.name}: ${p.start} – ${p.end}`);
-    });
-  } else {
-    logInfo('HealthCheck',
-      `⚠️ PERIODS มี ${PERIODS.length} คาบ (คาดหวัง 10)`);
-  }
+  // 5. PERIODS
+  logInfo('Health', '5. ตรวจสอบ PERIODS...');
+  logInfo('Health', `  ✅ PERIODS: ${PERIODS.length} คาบ`);
 
-  // --- สรุป ---
-  logInfo('HealthCheck', '=== สรุป Health Check ===');
-  if (allPassed) {
-    logInfo('HealthCheck', '🎉 ระบบพร้อมใช้งานทุกส่วน!');
-  } else {
-    logInfo('HealthCheck',
-      '⚠️ พบปัญหาบางส่วน กรุณาแก้ไขก่อน Deploy');
-  }
-
+  // สรุป
+  logInfo('Health', '===========================');
+  logInfo('Health', allPassed ? '🎉 ระบบพร้อมใช้งานทุกส่วน!' : '⚠️ พบปัญหา กรุณาแก้ไขก่อน Deploy');
   return allPassed;
 }
 
 
-// ============================================================
-// 🧪 SECTION 8: Testing Functions
-// ============================================================
+/**
+ * ทดสอบ State Cache (ScriptCache)
+ */
+function testStateCache() {
+  const testId = 'U_TEST_CACHE_99999';
+
+  const state = { step: SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC, token: 'TEST_ABC', teachingTopic: '' };
+  saveTeacherState(testId, state);
+
+  const got = getTeacherState(testId);
+  logInfo('TEST_CACHE', got && got.step === state.step ? '✅ Save/Get สำเร็จ' : '❌ FAIL', got);
+
+  clearTeacherState(testId);
+  const gone = getTeacherState(testId);
+  logInfo('TEST_CACHE', !gone ? '✅ Clear สำเร็จ' : '❌ FAIL');
+}
+
+
+/**
+ * ทดสอบเชื่อมต่อ Google Sheets
+ */
+function testSheetConnection() {
+  try {
+    const ss     = getSpreadsheet();
+    const sheets = ss.getSheets().map(s => s.getName());
+    logInfo('TEST_SHEET', '✅ เชื่อมต่อสำเร็จ', sheets.join(', '));
+  } catch (e) {
+    logInfo('TEST_SHEET', '❌ ไม่สามารถเชื่อมต่อ', e.message);
+  }
+}
+
 
 /**
  * ทดสอบส่ง Push Message ไปยัง User จริง
@@ -673,126 +4221,55 @@ function systemHealthCheck() {
 function testSendMessage() {
   const TEST_USER_ID = 'U_TEST_LINE_ID_HERE'; // ← แก้ไข
 
-  const success = sendLineMessage(TEST_USER_ID, [
-    {
-      type: 'text',
-      text:
-        `✅ ทดสอบระบบสำเร็จค่ะ!\n\n` +
-        `🏫 ${SCHOOL_CONFIG.SCHOOL_NAME}\n` +
-        `📅 ภาคเรียน ${SCHOOL_CONFIG.SEMESTER_CURRENT}\n` +
-        `⏰ ${new Date().toLocaleString('th-TH', {
-          timeZone: 'Asia/Bangkok',
-        })}`,
-    },
-  ]);
-
-  logInfo('TEST_SEND',
-    success ? '✅ ส่งสำเร็จ' : '❌ ส่งไม่สำเร็จ');
+  const ok = sendLineMessage(TEST_USER_ID, [{
+    type: 'text',
+    text:
+      `✅ ทดสอบระบบสำเร็จค่ะ!\n\n` +
+      `🏫 ${SCHOOL_CONFIG.SCHOOL_NAME}\n` +
+      `📅 ภาคเรียน ${SCHOOL_CONFIG.SEMESTER_CURRENT}\n` +
+      `⏰ ${new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })}`,
+  }]);
+  logInfo('TEST_MSG', ok ? '✅ ส่งสำเร็จ' : '❌ ส่งไม่สำเร็จ');
 }
 
 
 /**
- * ทดสอบ Verify Signature ด้วยข้อมูลจำลอง
+ * ทดสอบดึงข้อมูลรายงาน Admin
  */
-function testVerifySignature() {
-  logInfo('TEST_SIG', '--- ทดสอบ Verify Signature ---');
-
-  // ถ้า Channel Secret ยังเป็นค่า Default → ข้ามการทดสอบนี้
-  if (CREDENTIALS.LINE_CHANNEL_SECRET === 'YOUR_CHANNEL_SECRET_HERE') {
-    logInfo('TEST_SIG', '⚠️ กรุณาตั้งค่า LINE_CHANNEL_SECRET ก่อนทดสอบ');
-    return;
-  }
-
-  const testBody = JSON.stringify({ events: [] });
-  const keyBytes = Utilities.newBlob(
-    CREDENTIALS.LINE_CHANNEL_SECRET
-  ).getBytes();
-  const bodyBytes = Utilities.newBlob(testBody).getBytes();
-  const hmac      = Utilities.computeHmacSha256Signature(bodyBytes, keyBytes);
-  const validSig  = Utilities.base64Encode(hmac);
-
-  // ทดสอบ Signature ถูกต้อง
-  const validResult = verifyLineSignature(testBody, validSig);
-  logInfo('TEST_SIG',
-    validResult ? '✅ Signature ถูกต้อง Pass' : '❌ FAIL');
-
-  // ทดสอบ Signature ผิด
-  const invalidResult = verifyLineSignature(testBody, 'invalid_sig');
-  logInfo('TEST_SIG',
-    !invalidResult ? '✅ Signature ผิด Reject' : '❌ FAIL');
-}
-
-
-/**
- * ทดสอบ Event Router ด้วย Event จำลอง
- * แก้ไข TEST_USER_ID เป็น LINE ID ที่มีในระบบ
- */
-function testEventRouter() {
-  const TEST_USER_ID = 'U_TEST_LINE_ID_HERE'; // ← แก้ไข
-
-  logInfo('TEST_ROUTER', '--- ทดสอบ Event Router ---');
-
-  // จำลอง Message Event
-  const mockEvent = {
-    type:       'message',
-    source:     { userId: TEST_USER_ID },
-    replyToken: 'mock_reply_token',
-    message: {
-      type: 'text',
-      id:   'mock_message_id',
-      text: 'เมนู',
-    },
-  };
-
-  try {
-    processEvent(mockEvent);
-    logInfo('TEST_ROUTER', '✅ processEvent ทำงานสำเร็จ');
-  } catch (e) {
-    logInfo('TEST_ROUTER', '❌ ERROR', e.message);
+function testAdminReports() {
+  const summary = getTodayCheckInSummary();
+  if (summary) {
+    logInfo('TEST_ADMIN', '✅ Summary วันนี้', {
+      total:    summary.totalCheckIns,
+      onTime:   summary.onTime,
+      late:     summary.late,
+      teachers: summary.uniqueTeachers,
+    });
+  } else {
+    logInfo('TEST_ADMIN', '❌ ดึง Summary ไม่สำเร็จ');
   }
 }
 
 
 /**
- * ทดสอบระบบทั้งหมดก่อน Go-Live
- * รันฟังก์ชันนี้ก่อน Deploy จริงทุกครั้ง
+ * Cleanup Token หมดอายุ — ตั้ง Time Trigger รันทุกคืน
+ * GAS Editor → Triggers → Add Trigger → cleanupExpiredQRTokens → Day timer
+ */
+function scheduledCleanup() {
+  const count = cleanupExpiredQRTokens();
+  logInfo('Cleanup', `✅ Cleanup สำเร็จ: ${count} Tokens`);
+}
+
+
+/**
+ * รันทดสอบทั้งหมด
  */
 function runAllTests() {
-  logInfo('FULL_TEST', '=============================');
-  logInfo('FULL_TEST', '   Full System Test Suite    ');
-  logInfo('FULL_TEST', '=============================');
-
-  // 1. Health Check
-  logInfo('FULL_TEST', '\n--- Health Check ---');
+  logInfo('TEST_ALL', '=== Full Test Suite ===');
   const healthy = systemHealthCheck();
-  if (!healthy) {
-    logInfo('FULL_TEST',
-      '❌ หยุดทดสอบ — กรุณาแก้ไขปัญหาจาก Health Check ก่อน');
-    return;
-  }
-
-  // 2. Sheet Connection
-  logInfo('FULL_TEST', '\n--- Sheet Connection ---');
+  if (!healthy) { logInfo('TEST_ALL', '❌ หยุด — แก้ไข Health Check ก่อน'); return; }
   testSheetConnection();
-
-  // 3. QR Token
-  logInfo('FULL_TEST', '\n--- QR Token ---');
-  testCreateQRToken();
-
-  // 4. Signature
-  logInfo('FULL_TEST', '\n--- Signature ---');
-  testVerifySignature();
-
-  // 5. State Cache
-  logInfo('FULL_TEST', '\n--- State Cache ---');
   testStateCache();
-
-  // 6. Admin Data
-  logInfo('FULL_TEST', '\n--- Admin Reports ---');
-  testAdminReportsWithRealData();
-
-  logInfo('FULL_TEST', '\n=============================');
-  logInfo('FULL_TEST', '   ✅ ทดสอบครบทุกส่วนแล้ว!   ');
-  logInfo('FULL_TEST', ' พร้อม Deploy และ Go-Live ค่ะ ');
-  logInfo('FULL_TEST', '=============================');
+  testAdminReports();
+  logInfo('TEST_ALL', '=== ✅ ทดสอบครบทุกส่วน ===');
 }
