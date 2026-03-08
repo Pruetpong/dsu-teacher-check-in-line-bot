@@ -188,10 +188,11 @@ const SYSTEM_CONFIG = {
 
   // --- User Role ---
   USER_ROLE: {
-    TEACHER: 'Teacher',
-    MONITOR: 'Monitor',
-    ADMIN:   'Admin',
-    UNKNOWN: 'Unknown',
+    TEACHER:   'Teacher',
+    MONITOR:   'Monitor',
+    ADMIN:     'Admin',
+    DUAL_ROLE: 'DualRole', // ← ใหม่: ครูที่มีสิทธิ์ทั้งสอน + สร้าง QR
+    UNKNOWN:   'Unknown',
   },
 
   // --- Teacher State Machine ---
@@ -207,6 +208,19 @@ const SYSTEM_CONFIG = {
 
   // Prefix ของ Cache Key เพื่อป้องกันชนกับ Key อื่น
   CACHE_KEY_PREFIX: 'tcheckin_state_',
+
+  // Admin Mode Cache Key Prefix
+  // ใช้แยก Cache Key ของ Admin Mode ออกจาก Teacher State Cache
+  ADMIN_MODE_CACHE_KEY_PREFIX: 'admin_mode_',
+
+  // โหมดการทำงานของ Super Admin
+  // เก็บใน ScriptCache ตาม userId แต่ละคน
+  ADMIN_MODE: {
+    NONE:    'NONE',     // ยังไม่ได้เลือกโหมด → แสดงเมนูเลือกโหมด
+    REPORT:  'REPORT',   // โหมดรายงาน (Admin ปกติ)
+    TEACHER: 'TEACHER',  // โหมดครูผู้สอน (เช็คอิน)
+    MONITOR: 'MONITOR',  // โหมดหัวหน้าห้อง (สร้าง QR ทุกห้อง)
+  },
 
   // --- ประเภทผู้สร้าง QR (ตรงกับ Column Creator_Type ใน ClassMonitors_Master) ---
   CREATOR_TYPE: {
@@ -590,6 +604,74 @@ const MESSAGES = {
     `🏷️ ประเภท: ${creatorType}\n` +
     `📌 ขอบเขต: ${scopeLabel}\n` +
     `🆔 ${userId}`,
+  
+  // --- Super Admin Mode Switching ---
+  ADMIN_MODE_PROMPT:
+    'ป้าไพรยินดีต้อนรับนะคะ 👔\n\n' +
+    'วันนี้ต้องการทำอะไรก่อนคะ?\n' +
+    'กดเลือกโหมดการทำงานได้เลยนะคะ 😊',
+
+  ADMIN_MODE_TEACHER_ENTER: (name) =>
+    `✅ เข้าสู่โหมดครูผู้สอนแล้วนะคะ\n\n` +
+    `👩‍🏫 ${name}\n\n` +
+    `📲 สแกน QR Code จากหัวหน้าห้อง\n` +
+    `เพื่อเช็คอินได้เลยค่ะ 😊\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `💡 พิมพ์ "เมนู" เพื่อกลับ\n` +
+    `เมนูหลัก Admin ได้เลยนะคะ`,
+
+  ADMIN_MODE_MONITOR_ENTER:
+    '✅ เข้าสู่โหมดสร้าง QR แล้วนะคะ\n\n' +
+    '📲 คุณมีสิทธิ์สร้าง QR ได้ทุกห้องเรียนค่ะ\n\n' +
+    '━━━━━━━━━━━━━━━━━━\n' +
+    '💡 พิมพ์ "เมนู" เพื่อกลับ\n' +
+    'เมนูหลัก Admin ได้เลยนะคะ',
+
+  ADMIN_MODE_REPORT_ENTER:
+    '✅ เข้าสู่โหมดรายงานแล้วนะคะ\n\n' +
+    '📊 กดปุ่มด้านล่างเพื่อดูรายงานได้เลยค่ะ\n\n' +
+    '━━━━━━━━━━━━━━━━━━\n' +
+    '💡 พิมพ์ "เมนู" เพื่อกลับ\n' +
+    'เมนูหลัก Admin ได้เลยนะคะ',
+
+  ADMIN_MODE_EXIT:
+    '✅ กลับสู่เมนูหลัก Admin แล้วนะคะ 😊',
+
+  ADMIN_NO_TEACHER_PROFILE:
+    'ป้าไพรขอโทษด้วยนะคะ 🙏\n\n' +
+    '⚠️ ยังไม่พบข้อมูลครูของคุณในระบบค่ะ\n\n' +
+    'กรุณาลงทะเบียนในฐานะครูก่อนนะคะ:\n' +
+    'พิมพ์  /reg ชื่อของคุณ\n' +
+    'เช่น   /reg สมชาย\n\n' +
+    'หรือให้ผู้ดูแลเพิ่มข้อมูลใน\n' +
+    'Teachers_Master Sheet ได้เลยค่ะ 🙏',
+  
+  // --- Dual-Role Teacher (หัวหน้าระดับชั้น) ---
+  DUAL_ROLE_MODE_PROMPT:
+    'ป้าไพรยินดีต้อนรับนะคะ 👋\n\n' +
+    'วันนี้ต้องการทำอะไรก่อนคะ?\n' +
+    'กดเลือกโหมดการทำงานได้เลยนะคะ 😊',
+
+  DUAL_ROLE_MODE_TEACHER_ENTER: (name) =>
+    `✅ เข้าสู่โหมดครูผู้สอนแล้วนะคะ\n\n` +
+    `👩‍🏫 ${name}\n\n` +
+    `📲 สแกน QR Code จากหัวหน้าห้อง\n` +
+    `เพื่อเช็คอินได้เลยค่ะ 😊\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `💡 พิมพ์ "เมนู" เพื่อกลับ\n` +
+    `เมนูเลือกโหมดได้เลยนะคะ`,
+
+  DUAL_ROLE_MODE_MONITOR_ENTER: (scopeLabel) =>
+    `✅ เข้าสู่โหมดสร้าง QR แล้วนะคะ\n\n` +
+    `📌 ขอบเขต: ${scopeLabel}\n\n` +
+    `📲 กดปุ่ม "สร้าง QR คาบเรียน"\n` +
+    `เพื่อสร้าง QR ให้ครูสแกนได้เลยค่ะ 😊\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `💡 พิมพ์ "เมนู" เพื่อกลับ\n` +
+    `เมนูเลือกโหมดได้เลยนะคะ`,
+
+  DUAL_ROLE_MODE_EXIT:
+    '✅ กลับสู่เมนูเลือกโหมดแล้วนะคะ 😊',
 };
 
 
