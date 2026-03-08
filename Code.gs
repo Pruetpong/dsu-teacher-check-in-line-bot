@@ -918,6 +918,14 @@ function handleConfirmQR(userId, monitorData, params) {
     const teacher = getTeacherById(subject['Teacher_ID']);
     const period  = getPeriodByNumber(periodNumber);
 
+    const periodEndNumber = Number(subject['Period_End_Number'] || periodNumber);
+    const periodEnd       = getPeriodByNumber(periodEndNumber);
+    const periodRangeLabel = buildPeriodLabel(
+      period ? period.name : `คาบที่ ${periodNumber}`,
+      periodEndNumber,
+      periodNumber
+    );
+
     // สร้าง QR Token ใน Sheet
     const token = createQRSession({
       subjectCode:     subject['Subject_Code'],
@@ -926,18 +934,19 @@ function handleConfirmQR(userId, monitorData, params) {
       teacherName:     teacher ? teacher['Teacher_Name'] : subject['Teacher_ID'],
       classroom:       classroom,
       periodNumber:    periodNumber,
-      periodName:      period ? period.name : `คาบที่ ${periodNumber}`,
+      periodEndNumber: periodEndNumber,                                  // ← ใหม่
+      periodName:      periodRangeLabel,
       createdByLineId: userId,
       createdByName:   monitorData['Student_Name'],
     });
 
     // สร้าง URL และ QR Image
-    const qrUrl      = buildQRUrl(token);
-    const qrImageUrl = buildQRImageUrl(qrUrl);
-    const periodLabel = `${period ? period.name : `คาบที่ ${periodNumber}`} — ${subject['Subject_Name']}`;
+    const qrUrl        = buildQRUrl(token);
+    const qrImageUrl   = buildQRImageUrl(qrUrl);
+    const displayLabel = `${periodRangeLabel} — ${subject['Subject_Name']}`;
 
     sendLineMessage(userId, [
-      { type: 'text', text: MESSAGES.QR_SUCCESS(periodLabel, SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES) },
+      { type: 'text', text: MESSAGES.QR_SUCCESS(displayLabel, SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES) },
       { type: 'image', originalContentUrl: qrImageUrl, previewImageUrl: qrImageUrl },
       buildMonitorQuickReply(),
     ]);
@@ -1095,15 +1104,20 @@ function sendMonitorStatus(userId, monitorData) {
   ];
 
   schedules.forEach(s => {
-    const periodNum  = Number(s['Period_Number']);
-    const period     = getPeriodByNumber(periodNum);
-    const timeLabel  = period ? `${period.start}–${period.end}` : '';
-    const isChecked  = checkedPeriods.has(periodNum);
-    const icon       = isChecked ? '✅' : '⏳';
-    const statusText = isChecked ? 'เช็คอินแล้วค่ะ' : 'รอเช็คอินค่ะ';
+    const periodNum    = Number(s['Period_Number']);
+    const periodEndNum = Number(s['Period_End_Number'] || s['Period_Number']);
+    const period       = getPeriodByNumber(periodNum);
+    const periodEnd    = getPeriodByNumber(periodEndNum);
+    const timeLabel    = (period && periodEnd)
+      ? `${period.start}–${periodEnd.end}`
+      : (period ? `${period.start}–${period.end}` : '');
+    const pLabel       = buildPeriodLabel(s['Period_Name'], periodEndNum, periodNum);
+    const isChecked    = checkedPeriods.has(periodNum);
+    const icon         = isChecked ? '✅' : '⏳';
+    const statusText   = isChecked ? 'เช็คอินแล้วค่ะ' : 'รอเช็คอินค่ะ';
 
     lines.push(
-      `${icon} ${s['Period_Name']} (${timeLabel})\n` +
+      `${icon} ${pLabel} (${timeLabel})\n` +
       `   📚 ${s['Subject_Name']}\n` +
       `   ${statusText}`
     );
@@ -1134,9 +1148,11 @@ function handleTeacherEvent(event, teacherData) {
     } else if (event.type === 'postback') {
       handleTeacherPostback(event, teacherData);
     } else {
-      // ถ้ากำลังกรอกข้อมูลอยู่ → เตือนให้พิมพ์
+      // ถ้ากำลังกรอกข้อมูลอยู่ → เตือนให้พิมพ์ตามแต่ละ State
       const state = getTeacherState(event.source.userId);
-      if (state && state.step !== SYSTEM_CONFIG.TEACHER_STATE.IDLE) {
+      if (state && state.step === SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
+        handleTeacherBlockedInTeaching(event.source.userId, state);
+      } else if (state && state.step !== SYSTEM_CONFIG.TEACHER_STATE.IDLE) {
         remindTeacherToType(event.source.userId, state);
       } else {
         sendTeacherMainMenu(event.source.userId, teacherData);
@@ -1190,6 +1206,14 @@ function handleTeacherMessage(event, teacherData) {
   const step = currentState ? currentState.step : SYSTEM_CONFIG.TEACHER_STATE.IDLE;
 
   switch (step) {
+    case SYSTEM_CONFIG.TEACHER_STATE.SCANNED:
+      // รอกดปุ่ม — ถ้าพิมพ์ข้อความแทนให้เตือน
+      remindTeacherToType(userId, currentState);
+      break;
+    case SYSTEM_CONFIG.TEACHER_STATE.TEACHING:
+      // กำลังสอนอยู่ — Block ทุกข้อความ (ยกเว้น /help, /status, ยกเลิก ที่จัดการไปก่อนแล้ว)
+      handleTeacherBlockedInTeaching(userId, currentState);
+      break;
     case SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC:
       handleTopicInput(userId, teacherData, text, currentState);
       break;
@@ -1218,6 +1242,12 @@ function handleTeacherPostback(event, teacherData) {
   const action = params['action'];
 
   switch (action) {
+    case 'confirm_teaching':      // ← ใหม่: ครูกดปุ่ม "เข้าสอน"
+      handleConfirmTeaching(userId, teacherData);
+      break;
+    case 'request_checkout':      // ← ใหม่: ครูกดปุ่ม "เช็คเอาท์"
+      handleCheckoutRequest(userId, teacherData);
+      break;
     case 'confirm_checkin':
       handleConfirmCheckin(userId, teacherData);
       break;
@@ -1244,8 +1274,38 @@ function handleTeacherPostback(event, teacherData) {
 function handleQRScan(userId, teacherData, token) {
   logInfo('Teacher', `สแกน Token: ${token}`, teacherData['Teacher_Name']);
 
-  const validation = validateQRToken(token);
+  // ── 1. ตรวจสอบ State TEACHING ก่อนเลย ───────────────────
+  const existingState = getTeacherState(userId);
+  if (existingState && existingState.step === SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
+    const qrData = existingState.qrData;
+    const periodLabel = qrData
+      ? buildPeriodLabel(
+          qrData['Period_Name'],
+          Number(qrData['Period_End_Number'] || qrData['Period_Number']),
+          Number(qrData['Period_Number'])
+        )
+      : 'คาบที่กำลังสอนอยู่';
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: MESSAGES.QR_BLOCKED_IN_TEACHING(periodLabel),
+      quickReply: {
+        items: [{
+          type: 'action',
+          action: {
+            type: 'postback',
+            label: '📤 เช็คเอาท์',
+            data: 'action=request_checkout',
+            displayText: 'เช็คเอาท์หลังสอนเสร็จ',
+          },
+        }],
+      },
+    }]);
+    return;
+  }
+  // ────────────────────────────────────────────────────────
 
+  // ── 2. ตรวจสอบ QR Token ──────────────────────────────────
+  const validation = validateQRToken(token);
   if (!validation.valid) {
     const msgMap = {
       expired:   MESSAGES.QR_EXPIRED,
@@ -1274,26 +1334,147 @@ function handleQRScan(userId, teacherData, token) {
     return;
   }
 
-  // แสดงข้อมูลคาบ
-  sendLineMessage(userId, [flexClassInfo(qrData, teacherData)]);
-
-  // บันทึก State = WAITING_TOPIC
+  // ── 3. บันทึก State = SCANNED รอครูกดปุ่ม "เข้าสอน" ──────
   saveTeacherState(userId, {
+    step:   SYSTEM_CONFIG.TEACHER_STATE.SCANNED,
+    token:  token,
+    qrData: qrData,
+  });
+
+  // แสดง Card ข้อมูลคาบ พร้อมปุ่ม "เข้าสอน" และ "ยกเลิก"
+  sendLineMessage(userId, [flexClassInfo(qrData, teacherData)]);
+  // ────────────────────────────────────────────────────────
+}
+
+
+/**
+ * ครูกดปุ่ม "เข้าสอน" → บันทึกเวลาเข้าสอน → เปลี่ยน State เป็น TEACHING
+ * State: SCANNED → TEACHING
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function handleConfirmTeaching(userId, teacherData) {
+  const currentState = getTeacherState(userId);
+  if (!currentState || currentState.step !== SYSTEM_CONFIG.TEACHER_STATE.SCANNED) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.SESSION_TIMEOUT }]);
+    clearTeacherState(userId);
+    return;
+  }
+
+  const qrData      = currentState.qrData;
+  const checkinTime = new Date();
+
+  // คำนวณ Status (ตรงเวลา / สาย) ณ ตอนกดเข้าสอน
+  const period = getPeriodByNumber(Number(qrData['Period_Number']));
+  let status   = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+  if (period) {
+    const [sh, sm] = period.start.split(':').map(Number);
+    const graceEnd = new Date();
+    graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
+    if (checkinTime > graceEnd) status = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
+  }
+
+  // บันทึก State = TEACHING พร้อม checkinTime และ status
+  saveTeacherState(userId, {
+    ...currentState,
+    step:        SYSTEM_CONFIG.TEACHER_STATE.TEACHING,
+    checkinTime: checkinTime.toISOString(),
+    status:      status,
+  });
+
+  const periodLabel = buildPeriodLabel(
+    qrData['Period_Name'],
+    Number(qrData['Period_End_Number'] || qrData['Period_Number']),
+    Number(qrData['Period_Number'])
+  );
+
+  // ส่งข้อความยืนยัน + Quick Reply ปุ่มเช็คเอาท์
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.TEACHING_STARTED(periodLabel),
+    quickReply: {
+      items: [{
+        type: 'action',
+        action: {
+          type: 'postback',
+          label: '📤 เช็คเอาท์',
+          data: 'action=request_checkout',
+          displayText: 'เช็คเอาท์หลังสอนเสร็จ',
+        },
+      }],
+    },
+  }]);
+
+  logInfo('Teacher', `✅ เข้าสอน: ${teacherData['Teacher_Name']} — ${periodLabel}`);
+}
+
+
+/**
+ * ครูกดปุ่ม "เช็คเอาท์" → เปลี่ยน State เป็น WAITING_TOPIC
+ * State: TEACHING → WAITING_TOPIC
+ *
+ * @param {string} userId
+ * @param {Object} teacherData
+ */
+function handleCheckoutRequest(userId, teacherData) {
+  const currentState = getTeacherState(userId);
+  if (!currentState || currentState.step !== SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.SESSION_TIMEOUT }]);
+    clearTeacherState(userId);
+    return;
+  }
+
+  // เก็บ checkinTime และ status ไว้ใน State เดิม
+  saveTeacherState(userId, {
+    ...currentState,
     step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC,
-    token:         token,
-    qrData:        qrData,
     teachingTopic: '',
     assignment:    '',
   });
 
-  Utilities.sleep(500);
   sendLineMessage(userId, [{
     type: 'text',
-    text: MESSAGES.ASK_TOPIC,
+    text: MESSAGES.ASK_CHECKOUT_TOPIC,
     quickReply: {
       items: [{
         type: 'action',
         action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+      }],
+    },
+  }]);
+}
+
+
+/**
+ * ครูพิมพ์ข้อความหรือส่ง Sticker ขณะอยู่ใน State TEACHING
+ * → Block + แสดงปุ่มเช็คเอาท์ทุกครั้ง
+ *
+ * @param {string} userId
+ * @param {Object} state - current teacher state
+ */
+function handleTeacherBlockedInTeaching(userId, state) {
+  const qrData = state ? state.qrData : null;
+  const periodLabel = qrData
+    ? buildPeriodLabel(
+        qrData['Period_Name'],
+        Number(qrData['Period_End_Number'] || qrData['Period_Number']),
+        Number(qrData['Period_Number'])
+      )
+    : 'คาบที่กำลังสอนอยู่';
+
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: MESSAGES.BLOCKED_IN_TEACHING(periodLabel),
+    quickReply: {
+      items: [{
+        type: 'action',
+        action: {
+          type: 'postback',
+          label: '📤 เช็คเอาท์',
+          data: 'action=request_checkout',
+          displayText: 'เช็คเอาท์หลังสอนเสร็จ',
+        },
       }],
     },
   }]);
@@ -1356,20 +1537,31 @@ function handleAssignmentInput(userId, teacherData, text, currentState) {
   const qrData = currentState.qrData;
   const period = getPeriodByNumber(Number(qrData['Period_Number']));
 
+  const periodEndNumber = Number(qrData['Period_End_Number'] || qrData['Period_Number']);
+  const periodEnd       = getPeriodByNumber(periodEndNumber);
+  const periodLabel     = buildPeriodLabel(
+    qrData['Period_Name'],
+    periodEndNumber,
+    Number(qrData['Period_Number'])
+  );
+
   const checkinData = {
-    teacherName:   teacherData['Teacher_Name'],
-    teacherId:     teacherData['Teacher_ID'],
-    subjectCode:   qrData['Subject_Code'],
-    subjectName:   qrData['Subject_Name'] || qrData['Subject_Code'],
-    classroom:     qrData['Classroom'],
-    periodNumber:  Number(qrData['Period_Number']),
-    periodName:    qrData['Period_Name'] || `คาบที่ ${qrData['Period_Number']}`,
-    timeStart:     period ? period.start : '-',
-    timeEnd:       period ? period.end   : '-',
-    day:           getTodayDayName(),
-    teachingTopic: currentState.teachingTopic,
-    assignment:    assignment,
-    token:         currentState.token,
+    teacherName:     teacherData['Teacher_Name'],
+    teacherId:       teacherData['Teacher_ID'],
+    subjectCode:     qrData['Subject_Code'],
+    subjectName:     qrData['Subject_Name'] || qrData['Subject_Code'],
+    classroom:       qrData['Classroom'],
+    periodNumber:    Number(qrData['Period_Number']),
+    periodEndNumber: periodEndNumber,                          // ← ใหม่
+    periodName:      periodLabel,
+    timeStart:       period    ? period.start    : '-',
+    timeEnd:         periodEnd ? periodEnd.end   : '-',        // ← ใหม่: ใช้เวลาสิ้นสุดของคาบสุดท้าย
+    day:             getTodayDayName(),
+    teachingTopic:   currentState.teachingTopic,
+    assignment:      assignment,
+    token:           currentState.token,
+    checkinTime:     currentState.checkinTime || new Date().toISOString(), // ← ใหม่
+    status:          currentState.status || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME, // ← ใหม่
   };
 
   saveTeacherState(userId, {
@@ -1391,7 +1583,7 @@ function handleAssignmentInput(userId, teacherData, text, currentState) {
  * @param {Object} teacherData
  */
 function handleConfirmCheckin(userId, teacherData) {
-  logInfo('Teacher', `ยืนยันเช็คอิน: ${teacherData['Teacher_Name']}`);
+  logInfo('Teacher', `ยืนยันเช็คเอาท์: ${teacherData['Teacher_Name']}`);
 
   const currentState = getTeacherState(userId);
   if (!currentState || currentState.step !== SYSTEM_CONFIG.TEACHER_STATE.CONFIRM) {
@@ -1416,42 +1608,48 @@ function handleConfirmCheckin(userId, teacherData) {
   // ────────────────────────────────────────────────────────
 
   try {
+    const checkoutTime    = new Date();
+    const checkinTime     = checkinData.checkinTime
+      ? new Date(checkinData.checkinTime)
+      : checkoutTime;
+    const durationMinutes = Math.round((checkoutTime - checkinTime) / 60000);
+
     const success = saveCheckIn({
-      teacherId:     checkinData.teacherId,
-      teacherName:   checkinData.teacherName,
-      subjectCode:   checkinData.subjectCode,
-      subjectName:   checkinData.subjectName,
-      classroom:     checkinData.classroom,
-      periodNumber:  checkinData.periodNumber,
-      periodName:    checkinData.periodName,
-      timeStart:     checkinData.timeStart,
-      timeEnd:       checkinData.timeEnd,
-      day:           checkinData.day,
-      teachingTopic: checkinData.teachingTopic,
-      assignment:    checkinData.assignment,
-      qrToken:       checkinData.token,
+      teacherId:       checkinData.teacherId,
+      teacherName:     checkinData.teacherName,
+      subjectCode:     checkinData.subjectCode,
+      subjectName:     checkinData.subjectName,
+      classroom:       checkinData.classroom,
+      periodNumber:    checkinData.periodNumber,
+      periodEndNumber: checkinData.periodEndNumber,            // ← ใหม่
+      periodName:      checkinData.periodName,
+      timeStart:       checkinData.timeStart,
+      timeEnd:         checkinData.timeEnd,
+      day:             checkinData.day,
+      teachingTopic:   checkinData.teachingTopic,
+      assignment:      checkinData.assignment,
+      qrToken:         checkinData.token,
+      status:          checkinData.status || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME,
+      checkinTime:     checkinTime,                            // ← ใหม่
+      checkoutTime:    checkoutTime,                           // ← ใหม่
+      durationMinutes: durationMinutes,                        // ← ใหม่
+      checkoutStatus:  SYSTEM_CONFIG.CHECKOUT_STATUS.COMPLETED, // ← ใหม่
     });
 
     if (!success) throw new Error('saveCheckIn returned false');
 
     markQRTokenAsUsed(checkinData.token, userId);
 
-    // คำนวณ Status
-    const period = getPeriodByNumber(checkinData.periodNumber);
-    let status = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
-    if (period) {
-      const [sh, sm] = period.start.split(':').map(Number);
-      const graceEnd = new Date();
-      graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
-      if (new Date() > graceEnd) status = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
-    }
-
     // แสดงผลสำเร็จ
-    sendLineMessage(userId, [flexCheckinSuccess({ ...checkinData, status })]);
+    sendLineMessage(userId, [flexCheckinSuccess({
+      ...checkinData,
+      checkoutTime:    checkoutTime,
+      durationMinutes: durationMinutes,
+    })]);
 
-    // แจ้ง Monitor และ Admin (Non-blocking)
+    // แจ้ง Monitor และ Admin
     notifyMonitorAfterCheckin(checkinData, currentState.qrData);
-    notifyAdminAfterCheckin(checkinData, status);
+    notifyAdminAfterCheckin(checkinData, checkinData.status);
 
     clearTeacherState(userId);
 
@@ -1487,7 +1685,7 @@ function handleEditCheckin(userId, teacherData) {
 
   sendLineMessage(userId, [{
     type: 'text',
-    text: MESSAGES.EDIT_CHECKIN + MESSAGES.ASK_TOPIC,
+    text: MESSAGES.EDIT_CHECKIN + MESSAGES.ASK_CHECKOUT_TOPIC,
     quickReply: {
       items: [{
         type: 'action',
@@ -1579,12 +1777,20 @@ function sendTeacherStatus(userId, teacherData) {
   ];
 
   todayLogs.forEach(log => {
-    const icon = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
-    const time = new Date(log['Timestamp']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    const icon        = log['Status'] === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+    const checkinStr  = log['Checkin_Time']
+      ? new Date(log['Checkin_Time']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+      : new Date(log['Timestamp']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    const checkoutStr = log['Checkout_Time']
+      ? new Date(log['Checkout_Time']).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+      : '-';
+    const durationStr = log['Duration_Minutes'] ? `${log['Duration_Minutes']} นาที` : '-';
+
     lines.push(
       `${icon} ${log['Period_Name']}\n` +
       `   📚 ${log['Subject_Name']}\n` +
-      `   🕐 ${time} น.\n` +
+      `   🟢 เข้า ${checkinStr} น. → 🔴 ออก ${checkoutStr} น.\n` +
+      `   ⏱️ รวม ${durationStr}\n` +
       `   📝 ${log['Teaching_Topic'] || '-'}`
     );
   });
@@ -1657,6 +1863,14 @@ function handleTeacherKeyword(userId, teacherData, text) {
  * @param {Object} teacherData
  */
 function handleTeacherCancel(userId, teacherData) {
+  const currentState = getTeacherState(userId);
+
+  // ถ้าอยู่ใน TEACHING → ไม่อนุญาตให้ยกเลิก ต้อง Checkout ก่อน
+  if (currentState && currentState.step === SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
+    handleTeacherBlockedInTeaching(userId, currentState);
+    return;
+  }
+
   clearTeacherState(userId);
   sendLineMessage(userId, [{ type: 'text', text: MESSAGES.CANCEL_CHECKIN }]);
 }
@@ -1680,9 +1894,17 @@ function sendTeacherMainMenu(userId, teacherData) {
  * @param {Object} state
  */
 function remindTeacherToType(userId, state) {
-  const msg = state.step === SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC
-    ? MESSAGES.REMIND_TYPE_TOPIC
-    : MESSAGES.REMIND_TYPE_ASSIGNMENT;
+  let msg;
+  switch (state ? state.step : '') {
+    case SYSTEM_CONFIG.TEACHER_STATE.SCANNED:
+      msg = MESSAGES.REMIND_PRESS_TEACHING_BUTTON;
+      break;
+    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC:
+      msg = MESSAGES.REMIND_TYPE_TOPIC;
+      break;
+    default:
+      msg = MESSAGES.REMIND_TYPE_ASSIGNMENT;
+  }
   sendLineMessage(userId, [{ type: 'text', text: msg }]);
 }
 
@@ -2494,7 +2716,9 @@ function getScheduleByClassroomToday(classroom) {
       .filter(s =>
         s['Classroom'] === classroom &&
         s['Day']       === getTodayDayName() &&
-        s['Semester']  === SCHOOL_CONFIG.SEMESTER_CURRENT
+        s['Semester']  === SCHOOL_CONFIG.SEMESTER_CURRENT &&
+        // กรองออกแถวที่เป็นคาบต่อเนื่อง — Monitor เห็นเฉพาะ "คาบแรก" ของกลุ่ม
+        (!s['Is_Continuation'] || s['Is_Continuation'].toString().trim() !== 'Y')
       )
       .sort((a, b) => Number(a['Period_Number']) - Number(b['Period_Number']));
   } catch (e) { logInfo('Sheet', 'ERROR getScheduleByClassroomToday', e.message); return []; }
@@ -2560,6 +2784,12 @@ function getScheduleByCreatorScope(monitorData) {
       );
     }
 
+    // กรองออกแถวที่เป็นคาบต่อเนื่อง (Is_Continuation = 'Y')
+    // Monitor เห็นเฉพาะ "คาบแรก" ของกลุ่มเท่านั้น
+    filtered = filtered.filter(s =>
+      !s['Is_Continuation'] || s['Is_Continuation'].toString().trim() !== 'Y'
+    );
+
     return filtered.sort((a, b) => {
       // เรียงตาม Classroom ก่อน แล้วตาม Period
       const classCompare = a['Classroom'].localeCompare(b['Classroom'], 'th');
@@ -2615,7 +2845,7 @@ function createQRSession(params) {
     sheet.appendRow([
       token,
       params.subjectCode,
-      params.subjectName,      // ← เพิ่มใหม่ แก้ปัญหาชื่อวิชาหายใน Card
+      params.subjectName,
       params.teacherId,
       params.teacherName,
       params.classroom,
@@ -2626,8 +2856,9 @@ function createQRSession(params) {
       createdAt,
       expiresAt,
       SYSTEM_CONFIG.QR_STATUS.ACTIVE,
-      '',
-      '',
+      '',  // Used_By_LineID
+      '',  // Used_At
+      params.periodEndNumber || params.periodNumber,  // Period_End_Number ← ใหม่ Col 16
     ]);
 
     logInfo('Sheet', `สร้าง Token: ${token}`);
@@ -2805,33 +3036,28 @@ function saveCheckIn(params) {
     const sheet  = getSheet(SYSTEM_CONFIG.SHEETS.CHECKIN_LOG);
     const now    = new Date();
 
-    // คำนวณสถานะ
-    const period = getPeriodByNumber(params.periodNumber);
-    let status   = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
-    if (period) {
-      const [sh, sm] = period.start.split(':').map(Number);
-      const graceEnd = new Date();
-      graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
-      if (now > graceEnd) status = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
-    }
-
     sheet.appendRow([
-      now,
-      params.teacherId,
-      params.teacherName,
-      params.subjectCode,
-      params.subjectName,
-      params.classroom,
-      params.periodNumber,
-      params.periodName,
-      params.timeStart,
-      params.timeEnd,
-      params.day,
-      params.teachingTopic,
-      params.assignment || '-',
-      params.qrToken,
-      status,
-      SCHOOL_CONFIG.SEMESTER_CURRENT,
+      now,                                                              // Col 1:  Timestamp
+      params.teacherId,                                                 // Col 2:  Teacher_ID
+      params.teacherName,                                               // Col 3:  Teacher_Name
+      params.subjectCode,                                               // Col 4:  Subject_Code
+      params.subjectName,                                               // Col 5:  Subject_Name
+      params.classroom,                                                 // Col 6:  Classroom
+      params.periodNumber,                                              // Col 7:  Period_Number
+      params.periodName,                                                // Col 8:  Period_Name
+      params.timeStart,                                                 // Col 9:  Time_Start
+      params.timeEnd,                                                   // Col 10: Time_End
+      params.day,                                                       // Col 11: Day
+      params.teachingTopic,                                             // Col 12: Teaching_Topic
+      params.assignment || '-',                                         // Col 13: Assignment
+      params.qrToken,                                                   // Col 14: QR_Token
+      params.status,                                                    // Col 15: Status  ← ใช้จาก params
+      SCHOOL_CONFIG.SEMESTER_CURRENT,                                   // Col 16: Semester
+      params.periodEndNumber || params.periodNumber,                    // Col 17: Period_End_Number ← ใหม่
+      params.checkinTime     || now,                                    // Col 18: Checkin_Time ← ใหม่
+      params.checkoutTime    || now,                                    // Col 19: Checkout_Time ← ใหม่
+      params.durationMinutes != null ? params.durationMinutes : '',     // Col 20: Duration_Minutes ← ใหม่
+      params.checkoutStatus  || SYSTEM_CONFIG.CHECKOUT_STATUS.COMPLETED,// Col 21: Checkout_Status ← ใหม่
     ]);
 
     logInfo('Sheet', `บันทึกเช็คอิน: ${params.teacherName} — ${params.subjectName}`);
@@ -3061,15 +3287,24 @@ function flexPeriodList(classroom, schedules) {
   };
 
   const periodBubbles = schedules.map(subject => {
-    const period    = getPeriodByNumber(Number(subject['Period_Number']));
-    const timeLabel = period ? `${period.start} – ${period.end}` : '';
+    const period          = getPeriodByNumber(Number(subject['Period_Number']));
+    const periodEndNum    = Number(subject['Period_End_Number'] || subject['Period_Number']);
+    const periodEnd       = getPeriodByNumber(periodEndNum);
+    const timeLabel       = (period && periodEnd)
+      ? `${period.start} – ${periodEnd.end}`
+      : (period ? `${period.start} – ${period.end}` : '');
+    const periodLabel     = buildPeriodLabel(
+      subject['Period_Name'],
+      periodEndNum,
+      Number(subject['Period_Number'])
+    );
 
     return {
       type: 'bubble', size: 'kilo',
       header: {
         type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '12px',
         contents: [
-          { type: 'text', text: subject['Period_Name'] || `คาบที่ ${subject['Period_Number']}`, color: FLEX_COLORS.WHITE, size: 'sm', weight: 'bold' },
+          { type: 'text', text: periodLabel, color: FLEX_COLORS.WHITE, size: 'sm', weight: 'bold' },
           { type: 'text', text: timeLabel, color: '#B0BEC5', size: 'xs', margin: 'xs' },
         ],
       },
@@ -3117,9 +3352,14 @@ function flexPeriodList(classroom, schedules) {
  * @returns {Object}
  */
 function flexQRConfirm(subject, teacher, period) {
+  const periodEndNum    = Number(subject['Period_End_Number'] || subject['Period_Number']);
+  const periodEndObj    = getPeriodByNumber(periodEndNum);
+  const qrPeriodLabel   = buildPeriodLabel(period.name, periodEndNum, Number(subject['Period_Number']));
+  const qrEndTime       = periodEndObj ? periodEndObj.end : period.end;
+
   return {
     type: 'flex',
-    altText: `ยืนยันสร้าง QR Code — ${subject['Subject_Name']} ${period.name}`,
+    altText: `ยืนยันสร้าง QR Code — ${subject['Subject_Name']} ${qrPeriodLabel}`,
     contents: {
       type: 'bubble',
       header: {
@@ -3135,7 +3375,7 @@ function flexQRConfirm(subject, teacher, period) {
           _infoRow('📚', 'วิชา',       subject['Subject_Name'] || '-'),
           _infoRow('👩‍🏫', 'ครูผู้สอน', teacher ? teacher['Teacher_Name'] : '-'),
           _infoRow('🏫', 'ห้องเรียน', subject['Classroom'] || '-'),
-          _infoRow('🕐', 'คาบ',        `${period.name} (${period.start}–${period.end})`),
+          _infoRow('🕐', 'คาบ',        `${qrPeriodLabel} (${period.start}–${qrEndTime})`),
           _infoRow('📅', 'วันที่',      formatThaiDate(new Date())),
           { type: 'separator', margin: 'md' },
           {
@@ -3215,8 +3455,17 @@ function flexMonitorCheckinNotify(teacherName, subjectName, periodName, topic) {
  * @returns {Object}
  */
 function flexClassInfo(qrData, teacher) {
-  const period    = getPeriodByNumber(Number(qrData['Period_Number']));
-  const timeLabel = period ? `${period.start} – ${period.end}` : '-';
+  const period          = getPeriodByNumber(Number(qrData['Period_Number']));
+  const periodEndNumber = Number(qrData['Period_End_Number'] || qrData['Period_Number']);
+  const periodEnd       = getPeriodByNumber(periodEndNumber);
+  const timeLabel       = (period && periodEnd)
+    ? `${period.start} – ${periodEnd.end}`
+    : (period ? `${period.start} – ${period.end}` : '-');
+  const periodLabel     = buildPeriodLabel(
+    qrData['Period_Name'],
+    periodEndNumber,
+    Number(qrData['Period_Number'])
+  );
 
   return {
     type: 'flex',
@@ -3227,7 +3476,7 @@ function flexClassInfo(qrData, teacher) {
         type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
         contents: [
           { type: 'text', text: '📲 สแกน QR สำเร็จ!', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
-          { type: 'text', text: 'กรุณาตรวจสอบข้อมูลด้านล่างค่ะ', color: '#B0BEC5', size: 'xs', margin: 'xs' },
+          { type: 'text', text: 'ตรวจสอบข้อมูล แล้วกดปุ่ม "เข้าสอน" ด้านล่างค่ะ', color: '#B0BEC5', size: 'xs', margin: 'xs' },
         ],
       },
       body: {
@@ -3235,12 +3484,28 @@ function flexClassInfo(qrData, teacher) {
         contents: [
           { type: 'text', text: qrData['Subject_Name'] || qrData['Subject_Code'] || '-', size: 'lg', weight: 'bold', color: FLEX_COLORS.TEXT_MAIN, wrap: true },
           { type: 'separator', margin: 'md' },
-          _infoRow('👩‍🏫', 'ครูผู้สอน', teacher ? teacher['Teacher_Name'] : '-'),
-          _infoRow('🏫', 'ห้องเรียน', qrData['Classroom'] || '-'),
-          _infoRow('🕐', 'คาบเรียน',  `${qrData['Period_Name']} (${timeLabel})`),
-          _infoRow('📅', 'วันที่',     formatThaiDate(new Date())),
-          { type: 'separator', margin: 'md' },
-          { type: 'text', text: 'กรุณากรอกรายละเอียดการสอน\nด้วยการพิมพ์ตอบกลับในแชทค่ะ 👇', size: 'sm', color: FLEX_COLORS.NEUTRAL, wrap: true, margin: 'md' },
+          _infoRow('👩‍🏫', 'ครูผู้สอน',  teacher ? teacher['Teacher_Name'] : '-'),
+          _infoRow('🏫', 'ห้องเรียน',  qrData['Classroom'] || '-'),
+          _infoRow('🕐', 'คาบเรียน',   `${periodLabel} (${timeLabel})`),
+          _infoRow('📅', 'วันที่',      formatThaiDate(new Date())),
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '12px',
+        contents: [
+          {
+            type: 'button', style: 'secondary', height: 'sm', flex: 1,
+            action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+          },
+          {
+            type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm', flex: 2,
+            action: {
+              type: 'postback',
+              label: '✅ เข้าสอน',
+              data: 'action=confirm_teaching',
+              displayText: 'ยืนยันเข้าสอนค่ะ',
+            },
+          },
         ],
       },
     },
@@ -3314,11 +3579,20 @@ function flexCheckinSuccess(checkinData) {
   const isOnTime    = checkinData.status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
   const statusColor = isOnTime ? FLEX_COLORS.PRIMARY : FLEX_COLORS.WARNING;
   const statusIcon  = isOnTime ? '✅' : '⚠️';
-  const time        = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+
+  const checkinStr  = checkinData.checkinTime
+    ? new Date(checkinData.checkinTime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+    : '-';
+  const checkoutStr = checkinData.checkoutTime
+    ? new Date(checkinData.checkoutTime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
+    : '-';
+  const durationText = checkinData.durationMinutes != null
+    ? `${checkinData.durationMinutes} นาที`
+    : '-';
 
   return {
     type: 'flex',
-    altText: `✅ เช็คอินสำเร็จ — ${checkinData.subjectName}`,
+    altText: `✅ บันทึกการสอนสำเร็จ — ${checkinData.subjectName}`,
     contents: {
       type: 'bubble',
       body: {
@@ -3328,18 +3602,34 @@ function flexCheckinSuccess(checkinData) {
             type: 'box', layout: 'vertical', alignItems: 'center',
             contents: [
               { type: 'text', text: statusIcon, size: '5xl', align: 'center' },
-              { type: 'text', text: 'บันทึกการเข้าสอนสำเร็จ!', size: 'lg', weight: 'bold', color: statusColor, align: 'center', margin: 'md' },
+              { type: 'text', text: 'บันทึกการสอนสำเร็จ!', size: 'lg', weight: 'bold', color: statusColor, align: 'center', margin: 'md' },
               { type: 'text', text: checkinData.status || '', size: 'sm', color: statusColor, align: 'center' },
             ],
           },
           { type: 'separator', margin: 'lg' },
           _infoRow('📚', 'วิชา',        checkinData.subjectName   || '-'),
           _infoRow('🕐', 'คาบ',         checkinData.periodName    || '-'),
-          _infoRow('📝', 'เรื่องที่สอน', checkinData.teachingTopic || '-'),
-          _infoRow('📋', 'งานมอบหมาย',  checkinData.assignment    || 'ไม่มีงานมอบหมาย'),
+          _infoRow('🏫', 'ห้องเรียน',   checkinData.classroom     || '-'),
           { type: 'separator', margin: 'md' },
-          { type: 'text', text: `บันทึกเมื่อ ${time} น.`, size: 'xs', color: FLEX_COLORS.TEXT_SUB, align: 'center', margin: 'md' },
-          { type: 'text', text: 'ขอบคุณค่ะ 🙏', size: 'sm', color: FLEX_COLORS.NEUTRAL, align: 'center' },
+          _infoRow('🟢', 'เวลาเข้าสอน', `${checkinStr} น.`),
+          _infoRow('🔴', 'เวลาออก',     `${checkoutStr} น.`),
+          _infoRow('⏱️', 'รวมเวลาสอน',  durationText),
+          { type: 'separator', margin: 'md' },
+          {
+            type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.LIGHT_BG, cornerRadius: '8px', paddingAll: '10px', margin: 'sm',
+            contents: [
+              { type: 'text', text: '📝 เรื่องที่สอน', size: 'xs', color: FLEX_COLORS.NEUTRAL, weight: 'bold' },
+              { type: 'text', text: checkinData.teachingTopic || '-', size: 'sm', color: FLEX_COLORS.TEXT_MAIN, wrap: true, margin: 'xs' },
+            ],
+          },
+          {
+            type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.LIGHT_BG, cornerRadius: '8px', paddingAll: '10px', margin: 'sm',
+            contents: [
+              { type: 'text', text: '📋 งานมอบหมาย', size: 'xs', color: FLEX_COLORS.NEUTRAL, weight: 'bold' },
+              { type: 'text', text: checkinData.assignment || 'ไม่มีงานมอบหมาย', size: 'sm', color: checkinData.assignment ? FLEX_COLORS.TEXT_MAIN : FLEX_COLORS.TEXT_SUB, wrap: true, margin: 'xs' },
+            ],
+          },
+          { type: 'text', text: 'ขอบคุณค่ะ 🙏', size: 'sm', color: FLEX_COLORS.NEUTRAL, align: 'center', margin: 'md' },
         ],
       },
     },
