@@ -100,8 +100,7 @@ function doPost(e) {
   // LINE จะ Retry ถ้าไม่ได้รับภายใน 30 วินาที
   const response = ContentService
     .createTextOutput(JSON.stringify({ status: 'ok' }))
-    .setMimeType(ContentService.MimeType.JSON)
-    .setStatusCode(200);
+    .setMimeType(ContentService.MimeType.JSON);
 
   try {
     if (!e || !e.postData || !e.postData.contents) {
@@ -171,8 +170,7 @@ function doGet() {
   };
   return ContentService
     .createTextOutput(JSON.stringify(status, null, 2))
-    .setMimeType(ContentService.MimeType.JSON)
-    .setStatusCode(200);
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 
@@ -776,9 +774,16 @@ function handleMonitorPostback(event, monitorData) {
 
   switch (action) {
     case 'create_qr':
+      // รองรับทั้ง key เต็มและ key ย่อ
+      params.period    = params.period    || params.p;
+      params.classroom = params.classroom || params.c;
+      params.subject   = params.subject   || params.s;
       handleCreateQRRequest(userId, monitorData, params);
       break;
     case 'confirm_qr':
+      params.period    = params.period    || params.p;
+      params.classroom = params.classroom || params.c;
+      params.subject   = params.subject   || params.s;
       handleConfirmQR(userId, monitorData, params);
       break;
     case 'cancel_qr':
@@ -3215,7 +3220,14 @@ function getCheckInsByDateRange(startDate, endDate) {
  */
 function identifyUserRole(lineUserId) {
   if (getAdminLineIds().includes(lineUserId)) {
-    return { role: SYSTEM_CONFIG.USER_ROLE.ADMIN, data: { lineUserId } };
+    return {
+      role: SYSTEM_CONFIG.USER_ROLE.ADMIN,
+      data: {
+        lineUserId:   lineUserId,
+        Teacher_Name: 'Admin',
+        Teacher_ID:   lineUserId,
+      },
+    };
   }
 
   const teacher = getTeacherByLineId(lineUserId);
@@ -3327,7 +3339,7 @@ function flexPeriodList(classroom, schedules) {
           type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm',
           action: {
             type: 'postback', label: '📲 สร้าง QR',
-            data: `action=create_qr&period=${subject['Period_Number']}&classroom=${encodeURIComponent(classroom)}&subject=${encodeURIComponent(subject['Subject_Code'])}`,
+            data: `action=create_qr&p=${subject['Period_Number']}&c=${encodeURIComponent(subject['Classroom'])}&s=${encodeURIComponent(subject['Subject_Code'])}`,
             displayText: `สร้าง QR ${subject['Period_Name'] || `คาบที่ ${subject['Period_Number']}`}`,
           },
         }],
@@ -3392,7 +3404,7 @@ function flexQRConfirm(subject, teacher, period) {
             type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm', flex: 2,
             action: {
               type: 'postback', label: '✅ ยืนยันสร้าง QR',
-              data: `action=confirm_qr&period=${subject['Period_Number']}&classroom=${encodeURIComponent(subject['Classroom'])}&subject=${encodeURIComponent(subject['Subject_Code'])}`,
+              data: `action=confirm_qr&p=${subject['Period_Number']}&c=${encodeURIComponent(subject['Classroom'])}&s=${encodeURIComponent(subject['Subject_Code'])}`,
               displayText: 'ยืนยันสร้าง QR Code',
             },
           },
@@ -4562,4 +4574,183 @@ function runAllTests() {
   testStateCache();
   testAdminReports();
   logInfo('TEST_ALL', '=== ✅ ทดสอบครบทุกส่วน ===');
+}
+
+
+/**
+ * ตั้งค่า Time-based Trigger สำหรับ Cleanup QR Token หมดอายุ
+ * รันฟังก์ชันนี้ครั้งเดียวหลัง Deploy
+ * GAS Editor → Run → setupTimeTrigger
+ */
+function setupTimeTrigger() {
+  // ลบ Trigger เดิมที่ชื่อ cleanupExpiredQRTokens ทั้งหมดก่อน (ป้องกันซ้ำ)
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === 'scheduledCleanup') {
+      ScriptApp.deleteTrigger(trigger);
+      logInfo('Trigger', 'ลบ Trigger เดิมออกแล้ว');
+    }
+  });
+
+  // สร้าง Trigger ใหม่ — รันทุกคืนเวลา 02:00–03:00 น.
+  ScriptApp.newTrigger('scheduledCleanup')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)
+    .create();
+
+  logInfo('Trigger', '✅ ตั้ง Time Trigger สำเร็จ — รันทุกคืน 02:00 น.');
+}
+
+
+/**
+ * สร้าง LINE Rich Menu สำหรับ Teacher และ Monitor
+ *
+ * ⚠️  ต้อง Deploy Web App และตั้งค่า Credentials ก่อน
+ * รันฟังก์ชันนี้ครั้งเดียวหลัง Deploy
+ * GAS Editor → Run → setupRichMenu
+ *
+ * Rich Menu นี้จะแสดงสำหรับทุกคนที่ Add Bot
+ * (Default Rich Menu — ไม่แยกตาม Role)
+ */
+function setupRichMenu() {
+  const token = getCredential('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!token) {
+    logInfo('RichMenu', '❌ ไม่พบ LINE_CHANNEL_ACCESS_TOKEN');
+    return;
+  }
+
+  // Step 1: สร้าง Rich Menu Object
+  const richMenu = {
+    size:       { width: 2500, height: 843 },
+    selected:   true,
+    name:       'Teacher Check-in Menu',
+    chatBarText: 'เมนู',
+    areas: [
+      // ปุ่มซ้ายบน — สแกน QR / สร้าง QR
+      {
+        bounds: { x: 0,    y: 0, width: 833, height: 421 },
+        action: { type: 'message', text: 'QR' },
+      },
+      // ปุ่มกลางบน — ตารางวันนี้
+      {
+        bounds: { x: 833,  y: 0, width: 834, height: 421 },
+        action: { type: 'message', text: 'ตาราง' },
+      },
+      // ปุ่มขวาบน — สถานะ / ประวัติ
+      {
+        bounds: { x: 1667, y: 0, width: 833, height: 421 },
+        action: { type: 'message', text: '/status' },
+      },
+      // ปุ่มซ้ายล่าง — เมนูหลัก
+      {
+        bounds: { x: 0,    y: 421, width: 833, height: 422 },
+        action: { type: 'message', text: 'เมนู' },
+      },
+      // ปุ่มกลางล่าง — ประวัติ
+      {
+        bounds: { x: 833,  y: 421, width: 834, height: 422 },
+        action: { type: 'message', text: 'ประวัติ' },
+      },
+      // ปุ่มขวาล่าง — คู่มือ
+      {
+        bounds: { x: 1667, y: 421, width: 833, height: 422 },
+        action: { type: 'message', text: '/help' },
+      },
+    ],
+  };
+
+  // Step 2: สร้าง Rich Menu ใน LINE
+  const createResult = UrlFetchApp.fetch(
+    'https://api.line.me/v2/bot/richmenu',
+    {
+      method:             'post',
+      contentType:        'application/json',
+      headers:            { 'Authorization': `Bearer ${token}` },
+      payload:            JSON.stringify(richMenu),
+      muteHttpExceptions: true,
+    }
+  );
+
+  const createCode = createResult.getResponseCode();
+  if (createCode !== 200) {
+    logInfo('RichMenu', `❌ สร้างไม่สำเร็จ HTTP ${createCode}`, createResult.getContentText());
+    return;
+  }
+
+  const richMenuId = JSON.parse(createResult.getContentText()).richMenuId;
+  logInfo('RichMenu', `✅ สร้าง Rich Menu สำเร็จ ID: ${richMenuId}`);
+
+  // Step 3: Upload รูปภาพ Rich Menu
+  // ⚠️  ต้องอัปโหลดรูปเองด้วยมือใน LINE Official Account Manager
+  // หรือใช้ URL รูปที่เตรียมไว้แล้ว uncomment บรรทัดด้านล่าง
+  //
+  // const imageUrl = 'https://your-image-host.com/richmenu.png';
+  // uploadRichMenuImage(richMenuId, imageUrl, token);
+
+  // Step 4: Set เป็น Default Rich Menu
+  const setDefaultResult = UrlFetchApp.fetch(
+    `https://api.line.me/v2/bot/user/all/richmenu/${richMenuId}`,
+    {
+      method:             'post',
+      headers:            { 'Authorization': `Bearer ${token}` },
+      muteHttpExceptions: true,
+    }
+  );
+
+  const setDefaultCode = setDefaultResult.getResponseCode();
+  if (setDefaultCode === 200) {
+    logInfo('RichMenu', `✅ Set Default Rich Menu สำเร็จ`);
+    logInfo('RichMenu', `Rich Menu ID: ${richMenuId}`);
+    logInfo('RichMenu', `⚠️  อย่าลืมอัปโหลดรูปใน LINE Official Account Manager`);
+  } else {
+    logInfo('RichMenu', `❌ Set Default ไม่สำเร็จ HTTP ${setDefaultCode}`, setDefaultResult.getContentText());
+  }
+}
+
+
+/**
+ * ดู Rich Menu ที่มีอยู่ทั้งหมด
+ */
+function listRichMenus() {
+  const token = getCredential('LINE_CHANNEL_ACCESS_TOKEN');
+  const result = UrlFetchApp.fetch(
+    'https://api.line.me/v2/bot/richmenu/list',
+    {
+      method:             'get',
+      headers:            { 'Authorization': `Bearer ${token}` },
+      muteHttpExceptions: true,
+    }
+  );
+  logInfo('RichMenu', 'Rich Menus ทั้งหมด', result.getContentText());
+}
+
+
+/**
+ * ลบ Rich Menu ทั้งหมด (ใช้เมื่อต้องการ Reset)
+ */
+function deleteAllRichMenus() {
+  const token = getCredential('LINE_CHANNEL_ACCESS_TOKEN');
+  const listResult = UrlFetchApp.fetch(
+    'https://api.line.me/v2/bot/richmenu/list',
+    {
+      method:             'get',
+      headers:            { 'Authorization': `Bearer ${token}` },
+      muteHttpExceptions: true,
+    }
+  );
+
+  const menus = JSON.parse(listResult.getContentText()).richmenus || [];
+  menus.forEach(menu => {
+    UrlFetchApp.fetch(
+      `https://api.line.me/v2/bot/richmenu/${menu.richMenuId}`,
+      {
+        method:             'delete',
+        headers:            { 'Authorization': `Bearer ${token}` },
+        muteHttpExceptions: true,
+      }
+    );
+    logInfo('RichMenu', `ลบ ${menu.richMenuId} แล้ว`);
+  });
+
+  logInfo('RichMenu', `✅ ลบ ${menus.length} Rich Menus สำเร็จ`);
 }
