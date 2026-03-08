@@ -180,6 +180,12 @@ const SYSTEM_CONFIG = {
     LATE:    'เข้าสอนสาย',
   },
 
+  // --- Check-out Status (บันทึกลง Sheets) ---
+  CHECKOUT_STATUS: {
+    COMPLETED: 'Completed',
+    PENDING:   'Pending',
+  },
+
   // --- User Role ---
   USER_ROLE: {
     TEACHER: 'Teacher',
@@ -192,6 +198,8 @@ const SYSTEM_CONFIG = {
   // ค่าเหล่านี้ใช้ใน CacheService ไม่ได้บันทึกลง Sheets
   TEACHER_STATE: {
     IDLE:               'IDLE',
+    SCANNED:            'SCANNED',           // ← ใหม่: สแกน QR แล้ว รอกดปุ่ม "เข้าสอน"
+    TEACHING:           'TEACHING',          // ← ใหม่: กำลังสอนอยู่ รอกดปุ่ม "เช็คเอาท์"
     WAITING_TOPIC:      'WAITING_TOPIC',
     WAITING_ASSIGNMENT: 'WAITING_ASSIGNMENT',
     CONFIRM:            'CONFIRM',
@@ -399,6 +407,46 @@ const MESSAGES = {
     `LINE User ID:\n${newUserId}\n\n` +
     `กรุณาตรวจสอบและลงทะเบียน\n` +
     `ใน Google Sheets ด้วยนะคะ 📋`,
+
+  // --- Check-in / Teaching Flow (ใหม่) ---
+  REMIND_PRESS_TEACHING_BUTTON:
+    'ป้าไพรรออยู่นะคะ 😊\n\n' +
+    '👆 กรุณากดปุ่ม "✅ เข้าสอน" หรือ "❌ ยกเลิก"\n' +
+    'ในการ์ดด้านบนนะคะ 🙏',
+
+  TEACHING_STARTED: (periodLabel) =>
+    `✅ ป้าไพรบันทึกเวลาเข้าสอนแล้วนะคะ!\n\n` +
+    `🕐 ${periodLabel}\n\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `⚠️ อย่าลืมกดปุ่ม "📤 เช็คเอาท์"\n` +
+    `หลังสอนเสร็จด้วยนะคะ 🙏\n` +
+    `เพื่อบันทึกเนื้อหาและงานมอบหมายให้สมบูรณ์ค่ะ\n` +
+    `━━━━━━━━━━━━━━━━━━`,
+
+  BLOCKED_IN_TEACHING: (periodLabel) =>
+    `ป้าไพรขอแจ้งให้ทราบนะคะ 😊\n\n` +
+    `⚠️ ขณะนี้คุณยังอยู่ระหว่างการสอน\n` +
+    `${periodLabel} ค่ะ\n\n` +
+    `กรุณากดปุ่ม "📤 เช็คเอาท์"\n` +
+    `เพื่อบันทึกเนื้อหาหลังสอนเสร็จก่อนนะคะ 🙏`,
+
+  QR_BLOCKED_IN_TEACHING: (periodLabel) =>
+    `ป้าไพรขอแจ้งให้ทราบนะคะ 😊\n\n` +
+    `⚠️ ไม่สามารถเช็คอินคาบใหม่ได้ค่ะ\n` +
+    `เนื่องจากยังอยู่ระหว่างการสอน\n` +
+    `${periodLabel} อยู่ค่ะ\n\n` +
+    `กรุณากดปุ่ม "📤 เช็คเอาท์"\n` +
+    `เพื่อบันทึกข้อมูลก่อนนะคะ 🙏`,
+
+  // --- Checkout Flow (ใหม่) ---
+  ASK_CHECKOUT_TOPIC:
+    '📝 ป้าไพรขอถามหน่อยนะคะ\n\n' +
+    'วันนี้สอนเรื่องอะไรคะ?\n' +
+    'พิมพ์เรื่องที่สอนในคาบนี้ได้เลยค่ะ 😊\n\n' +
+    'ตัวอย่าง:\n' +
+    '• อสมการเชิงเส้นตัวแปรเดียว\n' +
+    '• การอ่านจับใจความสำคัญ\n' +
+    '• ระบบร่างกายมนุษย์',
 
   // --- Error / System ---
   ERROR_GENERAL:
@@ -609,6 +657,24 @@ function getCurrentPeriod() {
  */
 function getPeriodByNumber(periodNumber) {
   return PERIODS.find(p => p.number === Number(periodNumber)) || null;
+}
+
+
+/**
+ * สร้าง Label แสดงช่วงคาบ
+ * คาบเดี่ยว   → "คาบที่ 1"
+ * คาบต่อเนื่อง → "คาบที่ 1–2"
+ *
+ * @param {string} periodName        - ชื่อคาบจาก PERIODS หรือ Schedule ("คาบที่ 1")
+ * @param {number} periodEndNumber   - หมายเลขคาบสุดท้าย
+ * @param {number} periodStartNumber - หมายเลขคาบแรก
+ * @returns {string}
+ */
+function buildPeriodLabel(periodName, periodEndNumber, periodStartNumber) {
+  const start = Number(periodStartNumber);
+  const end   = Number(periodEndNumber);
+  if (!end || end === start) return periodName || `คาบที่ ${start}`;
+  return `คาบที่ ${start}–${end}`;
 }
 
 
