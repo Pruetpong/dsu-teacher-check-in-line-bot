@@ -1096,6 +1096,22 @@ function sendMonitorHelp(userId, monitorData) {
       `• 1 คาบ สร้างได้ 1 QR ค่ะ\n` +
       `• ป้าไพรจะแจ้งเมื่อครูเช็คอินแล้วนะคะ 📲\n\n` +
       `มีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`,
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '📲 สร้าง QR คาบเรียน', text: 'สร้าง QR' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '📅 ดูตารางวันนี้', text: 'ตาราง' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+        },
+      ],
+    },
   }]);
 }
 
@@ -1119,6 +1135,14 @@ function sendMonitorStatus(userId, monitorData) {
         `━━━━━━━━━━━━━━━━━━\n\n` +
         `ป้าไพรไม่พบตารางสอนวันนี้ค่ะ\n` +
         `กรุณาตรวจสอบกับฝ่ายวิชาการนะคะ 🙏`,
+      quickReply: {
+        items: [
+          {
+            type: 'action',
+            action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+          },
+        ],
+      },
     }]);
     return;
   }
@@ -1157,7 +1181,22 @@ function sendMonitorStatus(userId, monitorData) {
   lines.push(`✅ เช็คอินแล้ว ${checkedPeriods.size}/${schedules.length} คาบค่ะ`);
   lines.push(`\nมีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`);
 
-  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: lines.join('\n'),
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '📲 สร้าง QR คาบเรียน', text: 'สร้าง QR' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+        },
+      ],
+    },
+  }]);
 }
 
 
@@ -1671,11 +1710,38 @@ function handleConfirmCheckin(userId, teacherData) {
     markQRTokenAsUsed(checkinData.token, userId);
 
     // แสดงผลสำเร็จ
-    sendLineMessage(userId, [flexCheckinSuccess({
-      ...checkinData,
-      checkoutTime:    checkoutTime,
-      durationMinutes: durationMinutes,
-    })]);
+    sendLineMessage(userId, [
+      flexCheckinSuccess({
+        ...checkinData,
+        checkoutTime:    checkoutTime,
+        durationMinutes: durationMinutes,
+      }),
+      {
+        type: 'text',
+        text: 'ขอบคุณสำหรับการบันทึกนะคะ 🙏\nมีอะไรให้ป้าไพรช่วยเพิ่มเติมไหมคะ 😊',
+        quickReply: {
+          items: [
+            {
+              type: 'action',
+              action: {
+                type:        'postback',
+                label:       '📊 ดูประวัติของฉัน',
+                data:        'action=teacher_history',
+                displayText: 'ดูประวัติการเช็คอิน',
+              },
+            },
+            {
+              type: 'action',
+              action: { type: 'message', label: '📊 สถานะวันนี้', text: '/status' },
+            },
+            {
+              type: 'action',
+              action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+            },
+          ],
+        },
+      },
+    ]);
 
     // แจ้ง Monitor และ Admin
     notifyMonitorAfterCheckin(checkinData, currentState.qrData);
@@ -1766,6 +1832,27 @@ function sendTeacherHelp(userId, teacherData) {
       `QR Code มีอายุ ${SYSTEM_CONFIG.QR_TOKEN_EXPIRE_MINUTES} นาทีนะคะ\n` +
       `สแกนให้ทันก่อนหมดอายุด้วยนะคะ 🙏\n\n` +
       `มีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`,
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: {
+            type:        'postback',
+            label:       '📊 ประวัติการเช็คอิน',
+            data:        'action=teacher_history',
+            displayText: 'ดูประวัติการเช็คอิน',
+          },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '📊 สถานะวันนี้', text: '/status' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+        },
+      ],
+    },
   }]);
 }
 
@@ -2669,7 +2756,14 @@ function handleAdminMessage(event, adminData) {
   } else if (['export', 'ส่งออก', 'ลิงก์'].includes(textLow)) {
     handleExportReport(userId);
   } else {
-    sendAdminMainMenu(userId);
+    // ข้อความไม่ตรง Keyword ใด → ส่ง Quick Reply พร้อมข้อความแนะนำ
+    sendLineMessage(userId, [{
+      type: 'text',
+      text:
+        'ป้าไพรยินดีช่วยนะคะ 😊\n\n' +
+        'กดปุ่มด้านล่างเพื่อใช้งานได้เลยค่ะ 👇',
+      quickReply: buildAdminReportQuickReply(),
+    }]);
   }
 }
 
@@ -2714,11 +2808,19 @@ function handleTodaySummary(userId) {
 
   sendLineMessage(userId, [flexAdminDailyReport(summary)]);
 
+  Utilities.sleep(500);
   if (summary.totalCheckIns > 0) {
-    Utilities.sleep(500);
     sendLineMessage(userId, [{
       type: 'text',
       text: buildQuickOverviewText(summary),
+      quickReply: buildAdminReportQuickReply(),
+    }]);
+  } else {
+    // ไม่มีข้อมูลวันนี้ — ส่ง Quick Reply เดี่ยว ๆ
+    sendLineMessage(userId, [{
+      type: 'text',
+      text: MESSAGES.ADMIN_MORE_REPORT,
+      quickReply: buildAdminReportQuickReply(),
     }]);
   }
 }
@@ -2790,7 +2892,14 @@ function handleWeeklyReport(userId) {
   }]);
 
   Utilities.sleep(500);
-  sendLineMessage(userId, [flexAdminWeeklyReport(byDay, startDate, endDate)]);
+  sendLineMessage(userId, [
+    flexAdminWeeklyReport(byDay, startDate, endDate),
+    {
+      type: 'text',
+      text: MESSAGES.ADMIN_MORE_REPORT,
+      quickReply: buildAdminReportQuickReply(),
+    },
+  ]);
 }
 
 
@@ -2816,6 +2925,11 @@ function handleExportReport(userId) {
         `4. เลือก .xlsx หรือ .csv ได้เลยค่ะ`,
     },
     flexExportCard(sheetsUrl),
+    {
+      type: 'text',
+      text: MESSAGES.ADMIN_MORE_REPORT,
+      quickReply: buildAdminReportQuickReply(),
+    },
   ]);
 }
 
@@ -2844,6 +2958,7 @@ function handleTeacherDetail(userId, params) {
     sendLineMessage(userId, [{
       type: 'text',
       text: `📋 ${name}\nยังไม่มีการเช็คอินในวันนี้ค่ะ`,
+      quickReply: buildAdminReportQuickReply(),
     }]);
     return;
   }
@@ -2860,7 +2975,11 @@ function handleTeacherDetail(userId, params) {
     );
   });
 
-  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: lines.join('\n'),
+    quickReply: buildAdminReportQuickReply(),
+  }]);
 }
 
 
@@ -2891,6 +3010,7 @@ function handlePeriodDetail(userId, params) {
     sendLineMessage(userId, [{
       type: 'text',
       text: `📋 ${periodName}\nยังไม่มีการเช็คอินค่ะ`,
+      quickReply: buildAdminReportQuickReply(),
     }]);
     return;
   }
@@ -2908,7 +3028,11 @@ function handlePeriodDetail(userId, params) {
     );
   });
 
-  sendLineMessage(userId, [{ type: 'text', text: lines.join('\n') }]);
+  sendLineMessage(userId, [{
+    type: 'text',
+    text: lines.join('\n'),
+    quickReply: buildAdminReportQuickReply(),
+  }]);
 }
 
 
@@ -2937,6 +3061,7 @@ function sendAdminHelp(userId) {
       `💡 หรือกดปุ่ม Quick Reply\n` +
       `ด้านล่างได้เลยนะคะ 👇\n\n` +
       `มีอะไรให้ป้าไพรช่วยอีกไหมคะ 😊`,
+    quickReply: buildAdminReportQuickReply(),
   }]);
 }
 
@@ -4763,6 +4888,13 @@ function flexNoSchedule(classroom) {
           { type: 'text', text: `ห้อง ${classroom}\n${formatThaiDate(new Date())}`, size: 'sm', color: FLEX_COLORS.TEXT_SUB, align: 'center', wrap: true },
           { type: 'text', text: 'หากมีข้อสงสัย กรุณาติดต่อฝ่ายวิชาการค่ะ', size: 'xs', color: FLEX_COLORS.NEUTRAL, align: 'center', wrap: true, margin: 'md' },
         ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{
+          type: 'button', style: 'secondary', height: 'sm',
+          action: { type: 'message', label: '🏠 กลับเมนูหลัก', text: 'เมนู' },
+        }],
       },
     },
   };
