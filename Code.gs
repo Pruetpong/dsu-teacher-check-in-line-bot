@@ -255,7 +255,10 @@ function processEvent(event) {
 
   switch (userInfo.role) {
     case SYSTEM_CONFIG.USER_ROLE.ADMIN:
-      handleAdminEvent(event, userInfo.data);
+      handleSuperAdminEvent(event, userInfo);
+      break;
+    case SYSTEM_CONFIG.USER_ROLE.DUAL_ROLE:         // ← ใหม่
+      handleDualRoleEvent(event, userInfo);
       break;
     case SYSTEM_CONFIG.USER_ROLE.TEACHER:
       handleTeacherEvent(event, userInfo.data);
@@ -324,20 +327,42 @@ function handleFollowEvent(userId) {
       break;
 
     case SYSTEM_CONFIG.USER_ROLE.ADMIN:
-      sendLineMessage(userId, [
-        {
-          type: 'text',
-          text:
-            'สวัสดีค่ะ 🙏\n\n' +
-            'ป้าไพรมาในรูปแบบใหม่นะคะ 😊\n' +
-            'คราวนี้ป้าไพรมาช่วยดูแล\n' +
-            'ระบบเช็คอินการเข้าสอนโดยเฉพาะค่ะ\n\n' +
-            'ยินดีต้อนรับ Admin ฝ่ายวิชาการนะคะ 👔\n' +
-            'พิมพ์ /help เพื่อดูคำสั่งได้เลยค่ะ',
-        },
-        flexAdminMenu(),
-      ]);
+      sendLineMessage(userId, [{
+        type: 'text',
+        text:
+          'สวัสดีค่ะ 🙏\n\n' +
+          'ป้าไพรมาในรูปแบบใหม่นะคะ 😊\n' +
+          'คราวนี้ป้าไพรมาช่วยดูแล\n' +
+          'ระบบเช็คอินการเข้าสอนโดยเฉพาะค่ะ\n\n' +
+          '━━━━━━━━━━━━━━━━━━\n' +
+          '⚙️ ยินดีต้อนรับ Super Admin นะคะ\n' +
+          'คุณสามารถใช้งานได้ทุกฟีเจอร์ค่ะ\n' +
+          '━━━━━━━━━━━━━━━━━━',
+      }]);
+      sendSuperAdminMainMenu(userId);
       break;
+
+    case SYSTEM_CONFIG.USER_ROLE.DUAL_ROLE: {
+      const teacherData = userInfo.data.teacher;
+      sendLineMessage(userId, [{
+        type: 'text',
+        text:
+          `สวัสดีค่ะ ${teacherData['Teacher_Name']} 🙏\n\n` +
+          `ป้าไพรมาในรูปแบบใหม่นะคะ 😊\n` +
+          `คราวนี้ป้าไพรมาช่วยดูแล\n` +
+          `ระบบเช็คอินการเข้าสอนโดยเฉพาะค่ะ\n\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `⭐ คุณมีสิทธิ์ 2 บทบาทนะคะ\n` +
+          `👩‍🏫 ครูผู้สอน — เช็คอินเข้าสอน\n` +
+          `📲 หัวหน้าระดับ — สร้าง QR ให้ครู\n` +
+          `━━━━━━━━━━━━━━━━━━\n\n` +
+          `พิมพ์ /help เพื่อดูวิธีใช้งาน\n` +
+          `ได้เลยนะคะ 😊`,
+      }]);
+      Utilities.sleep(300);
+      sendDualRoleMainMenu(userId, teacherData);
+      break;
+    }
 
     default:
       sendLineMessage(userId, [{
@@ -1967,7 +1992,15 @@ function notifyAdminAfterCheckin(checkinData, status) {
       `🕐 ${checkinData.periodName} (${time} น.)\n` +
       `📝 ${checkinData.teachingTopic}`;
 
+    // ดึง LINE ID ของครูที่เพิ่งเช็คอิน
+    // เพื่อป้องกัน Admin แจ้งเตือนตัวเองซ้ำซ้อน
+    const checkerLineId = getTeacherLineIdByTeacherId(checkinData.teacherId);
+
     getAdminLineIds().forEach(adminId => {
+      if (checkerLineId && adminId === checkerLineId) {
+        logInfo('Teacher', 'ข้ามแจ้งเตือน — Admin เช็คอินตัวเอง', adminId);
+        return;
+      }
       sendLineMessage(adminId, [{ type: 'text', text: msg }]);
     });
   } catch (e) {
@@ -2034,10 +2067,553 @@ function clearTeacherState(userId) {
   }
 }
 
+// ── Admin Mode Management (ScriptCache) ──────────────────────
+// ใช้ Cache Key ต่างจาก Teacher State เพื่อไม่ให้ทับกัน
+// Key = ADMIN_MODE_CACHE_KEY_PREFIX + userId
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * บันทึกโหมดปัจจุบันของ Admin ลง ScriptCache
+ *
+ * @param {string} userId
+ * @param {string} mode  - ค่าจาก SYSTEM_CONFIG.ADMIN_MODE
+ */
+function saveAdminMode(userId, mode) {
+  try {
+    const key = SYSTEM_CONFIG.ADMIN_MODE_CACHE_KEY_PREFIX + userId;
+    CacheService.getScriptCache().put(key, mode, SYSTEM_CONFIG.STATE_CACHE_EXPIRE_SECONDS);
+    logInfo('AdminMode', `Set mode: ${mode}`, userId);
+  } catch (e) {
+    logInfo('AdminMode', 'ERROR saveAdminMode', e.message);
+  }
+}
+
+
+/**
+ * ดึงโหมดปัจจุบันของ Admin จาก ScriptCache
+ *
+ * @param {string} userId
+ * @returns {string} ค่าจาก SYSTEM_CONFIG.ADMIN_MODE (default: NONE)
+ */
+function getAdminMode(userId) {
+  try {
+    const key    = SYSTEM_CONFIG.ADMIN_MODE_CACHE_KEY_PREFIX + userId;
+    const cached = CacheService.getScriptCache().get(key);
+    return cached || SYSTEM_CONFIG.ADMIN_MODE.NONE;
+  } catch (e) {
+    logInfo('AdminMode', 'ERROR getAdminMode', e.message);
+    return SYSTEM_CONFIG.ADMIN_MODE.NONE;
+  }
+}
+
+
+/**
+ * ล้างโหมด Admin ออกจาก Cache (กลับสู่ NONE)
+ *
+ * @param {string} userId
+ */
+function clearAdminMode(userId) {
+  try {
+    const key = SYSTEM_CONFIG.ADMIN_MODE_CACHE_KEY_PREFIX + userId;
+    CacheService.getScriptCache().remove(key);
+    logInfo('AdminMode', 'Clear mode', userId);
+  } catch (e) {
+    logInfo('AdminMode', 'ERROR clearAdminMode', e.message);
+  }
+}
+
 
 // ============================================================
 // 👔 SECTION 7: Admin Flow
 // ============================================================
+
+// ============================================================
+// 👩‍🏫 Dual-Role Teacher Handler — สำหรับหัวหน้าระดับชั้น
+// ============================================================
+
+/**
+ * Entry Point สำหรับหัวหน้าระดับชั้น (Dual-Role Teacher)
+ * มีสิทธิ์ทั้งสอน (Teacher) และสร้าง QR (Monitor)
+ * ใช้ระบบ Mode Switching เดียวกับ Super Admin
+ * แต่มีเพียง 2 โหมด คือ TEACHER และ MONITOR
+ *
+ * @param {Object} event
+ * @param {Object} userInfo - { role: 'DualRole', data: { teacher, monitor } }
+ */
+function handleDualRoleEvent(event, userInfo) {
+  const userId      = event.source.userId;
+  const teacherData = userInfo.data.teacher;
+  const monitorData = userInfo.data.monitor;
+  const text        = (event.type === 'message' && event.message.type === 'text')
+    ? event.message.text.trim()
+    : '';
+  const textLow = text.toLowerCase();
+
+  // ── 1. CHECKIN: สแกน QR → Teacher Flow เสมอ ─────────────────
+  // ไม่ว่าจะอยู่โหมดใด การสแกน QR ต้องเข้า Teacher Flow เสมอ
+  if (text.startsWith('CHECKIN:')) {
+    handleTeacherEvent(event, teacherData);
+    return;
+  }
+
+  // ── 2. Postback ที่จัดการก่อน Mode Routing ───────────────────
+  if (event.type === 'postback') {
+    const params = parsePostbackData(event.postback.data);
+    const action = params['action'];
+
+    // สลับโหมด
+    if (action === 'admin_switch_mode') {
+      handleDualRoleModeSwitch(userId, params['mode'], teacherData, monitorData);
+      return;
+    }
+
+    // กลับเมนูหลัก Dual-Role
+    if (action === 'admin_main_menu') {
+      clearAdminMode(userId);
+      clearTeacherState(userId);
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.DUAL_ROLE_MODE_EXIT }]);
+      sendDualRoleMainMenu(userId, teacherData);
+      return;
+    }
+  }
+
+  // ── 3. คำสั่งกลับเมนูหลัก (ข้อความ) ─────────────────────────
+  const backKeywords = ['เมนู', 'menu', 'หน้าหลัก', 'กลับ'];
+  if (backKeywords.includes(textLow)) {
+    clearAdminMode(userId);
+    clearTeacherState(userId);
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.DUAL_ROLE_MODE_EXIT }]);
+    sendDualRoleMainMenu(userId, teacherData);
+    return;
+  }
+
+  // ── 4. Route ตาม Mode ─────────────────────────────────────────
+  const currentMode = getAdminMode(userId);
+  logInfo('DualRole', `Mode: ${currentMode}`, userId);
+
+  switch (currentMode) {
+
+    case SYSTEM_CONFIG.ADMIN_MODE.TEACHER:
+      handleTeacherEvent(event, teacherData);
+      break;
+
+    case SYSTEM_CONFIG.ADMIN_MODE.MONITOR:
+      handleMonitorEvent(event, monitorData);
+      break;
+
+    default:
+      // NONE — ยังไม่ได้เลือกโหมด → แสดงเมนูเลือกโหมด
+      sendDualRoleMainMenu(userId, teacherData);
+      break;
+  }
+}
+
+
+/**
+ * จัดการการสลับโหมดสำหรับ Dual-Role Teacher
+ * รองรับเฉพาะโหมด TEACHER และ MONITOR เท่านั้น
+ *
+ * @param {string} userId
+ * @param {string} targetMode  - ค่าจาก SYSTEM_CONFIG.ADMIN_MODE
+ * @param {Object} teacherData - ข้อมูลจาก Teachers_Master
+ * @param {Object} monitorData - ข้อมูลจาก ClassMonitors_Master
+ */
+function handleDualRoleModeSwitch(userId, targetMode, teacherData, monitorData) {
+  switch (targetMode) {
+
+    case SYSTEM_CONFIG.ADMIN_MODE.TEACHER:
+      saveAdminMode(userId, SYSTEM_CONFIG.ADMIN_MODE.TEACHER);
+      sendLineMessage(userId, [
+        { type: 'text', text: MESSAGES.DUAL_ROLE_MODE_TEACHER_ENTER(teacherData['Teacher_Name']) },
+        flexTeacherMenu(teacherData['Teacher_Name']),
+      ]);
+      break;
+
+    case SYSTEM_CONFIG.ADMIN_MODE.MONITOR: {
+      saveAdminMode(userId, SYSTEM_CONFIG.ADMIN_MODE.MONITOR);
+      const scopeLabel = getScopeLabel(monitorData);
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.DUAL_ROLE_MODE_MONITOR_ENTER(scopeLabel) }]);
+      Utilities.sleep(300);
+      sendMonitorMainMenu(userId, monitorData);
+      break;
+    }
+
+    default:
+      clearAdminMode(userId);
+      sendDualRoleMainMenu(userId, teacherData);
+  }
+}
+
+
+/**
+ * ส่งเมนูเลือกโหมดให้ Dual-Role Teacher
+ *
+ * @param {string} userId
+ * @param {Object} teacherData - ใช้ดึงชื่อครูแสดงในเมนู
+ */
+function sendDualRoleMainMenu(userId, teacherData) {
+  sendLineMessage(userId, [
+    flexDualRoleMenu(teacherData['Teacher_Name']),
+    {
+      type: 'text',
+      text: MESSAGES.DUAL_ROLE_MODE_PROMPT,
+      quickReply: {
+        items: [
+          {
+            type: 'action',
+            action: {
+              type:        'postback',
+              label:       '👩‍🏫 โหมดเช็คอิน',
+              data:        'action=admin_switch_mode&mode=TEACHER',
+              displayText: 'เข้าโหมดครูผู้สอน',
+            },
+          },
+          {
+            type: 'action',
+            action: {
+              type:        'postback',
+              label:       '📲 โหมดสร้าง QR',
+              data:        'action=admin_switch_mode&mode=MONITOR',
+              displayText: 'เข้าโหมดสร้าง QR',
+            },
+          },
+        ],
+      },
+    },
+  ]);
+}
+
+
+/**
+ * [DUAL-ROLE] Flex Card เมนูเลือกโหมด
+ *
+ * @param {string} teacherName
+ * @returns {Object} Flex Message
+ */
+function flexDualRoleMenu(teacherName) {
+  return {
+    type: 'flex',
+    altText: `สวัสดีค่ะ ${teacherName} — เลือกโหมดการทำงานค่ะ`,
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical',
+        backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '👋 สวัสดีค่ะ', color: FLEX_COLORS.WHITE, size: 'sm' },
+          { type: 'text', text: teacherName, color: FLEX_COLORS.WHITE, size: 'lg', weight: 'bold', margin: 'xs' },
+          { type: 'text', text: 'หัวหน้าระดับชั้น — เลือกโหมดการทำงาน', color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical',
+        spacing: 'sm', paddingAll: '12px',
+        contents: [
+
+          // ── โหมดครูผู้สอน ─────────────────────────────────
+          {
+            type: 'box', layout: 'horizontal',
+            backgroundColor: '#E8F5E9', cornerRadius: '10px',
+            paddingAll: '14px', margin: 'xs', spacing: 'md',
+            action: {
+              type:        'postback',
+              label:       'โหมดเช็คอิน',
+              data:        'action=admin_switch_mode&mode=TEACHER',
+              displayText: 'เข้าโหมดครูผู้สอน',
+            },
+            contents: [
+              { type: 'text', text: '👩‍🏫', size: 'xl', flex: 0 },
+              {
+                type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: 'โหมดครูผู้สอน', size: 'sm', weight: 'bold', color: FLEX_COLORS.PRIMARY },
+                  { type: 'text', text: 'สแกน QR Code เช็คอินการเข้าสอน', size: 'xs', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+                ],
+              },
+              { type: 'text', text: '›', size: 'lg', color: FLEX_COLORS.PRIMARY, flex: 0, align: 'end' },
+            ],
+          },
+
+          // ── โหมดสร้าง QR ──────────────────────────────────
+          {
+            type: 'box', layout: 'horizontal',
+            backgroundColor: '#FFF3E0', cornerRadius: '10px',
+            paddingAll: '14px', margin: 'xs', spacing: 'md',
+            action: {
+              type:        'postback',
+              label:       'โหมดสร้าง QR',
+              data:        'action=admin_switch_mode&mode=MONITOR',
+              displayText: 'เข้าโหมดสร้าง QR',
+            },
+            contents: [
+              { type: 'text', text: '📲', size: 'xl', flex: 0 },
+              {
+                type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: 'โหมดสร้าง QR', size: 'sm', weight: 'bold', color: FLEX_COLORS.ACCENT },
+                  { type: 'text', text: 'สร้าง QR Code ให้ครูในระดับสแกน', size: 'xs', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+                ],
+              },
+              { type: 'text', text: '›', size: 'lg', color: FLEX_COLORS.ACCENT, flex: 0, align: 'end' },
+            ],
+          },
+
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{
+          type: 'text',
+          text: '💡 กดที่การ์ดหรือ Quick Reply\nเพื่อเลือกโหมดการทำงานค่ะ',
+          size: 'xs', color: FLEX_COLORS.NEUTRAL,
+          align: 'center', wrap: true,
+        }],
+      },
+    },
+  };
+}
+
+
+/**
+ * Super Admin Entry Point
+ * ตรวจสอบโหมดปัจจุบันแล้ว Route ไปยัง Handler ที่ถูกต้อง
+ *
+ * ลำดับการตัดสินใจ:
+ *   1. CHECKIN: scan          → Teacher Flow เสมอ (ไม่ว่าจะอยู่โหมดไหน)
+ *   2. /reg ลงทะเบียนครู     → Registration Flow (ไม่ว่าจะอยู่โหมดไหน)
+ *   3. Postback reg_confirm   → Registration Confirm
+ *   4. เมนู / กลับ           → ล้างโหมด + Super Admin Menu
+ *   5. Postback switch_mode   → เปลี่ยนโหมด
+ *   6. Mode-based routing     → TEACHER / MONITOR / REPORT / NONE
+ *
+ * @param {Object} event
+ * @param {Object} userInfo - { role, data } จาก identifyUserRole()
+ */
+function handleSuperAdminEvent(event, userInfo) {
+  const userId  = event.source.userId;
+  const text    = (event.type === 'message' && event.message.type === 'text')
+    ? event.message.text.trim()
+    : '';
+  const textLow = text.toLowerCase();
+
+  // ── 1. CHECKIN: สแกน QR → Teacher Flow เสมอ ─────────────────
+  if (text.startsWith('CHECKIN:')) {
+    const teacherData = getTeacherByLineId(userId);
+    if (!teacherData) {
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_NO_TEACHER_PROFILE }]);
+      return;
+    }
+    handleTeacherEvent(event, teacherData);
+    return;
+  }
+
+  // ── 2. /reg ลงทะเบียนเป็นครู ─────────────────────────────────
+  // Admin ใช้คำสั่งนี้เพื่อผูก LINE ID กับ Teachers_Master
+  if (textLow.startsWith('/reg') && !textLow.startsWith('/reg-qr')) {
+    const keyword = text.slice(4).trim();
+    if (!keyword) {
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REG_USAGE }]);
+      return;
+    }
+    handleRegCommand(userId, keyword);
+    return;
+  }
+
+  // ── 3. Postback ที่ต้องจัดการก่อน Mode Routing ───────────────
+  if (event.type === 'postback') {
+    const params = parsePostbackData(event.postback.data);
+    const action = params['action'];
+
+    // ยืนยันลงทะเบียนครู — Admin ต้องผ่านจุดนี้ได้
+    if (action === 'reg_confirm') {
+      handleRegConfirm(userId, params['teacher_id']);
+      return;
+    }
+
+    // สลับโหมด
+    if (action === 'admin_switch_mode') {
+      handleAdminModeSwitch(userId, params['mode']);
+      return;
+    }
+
+    // กลับเมนูหลัก Admin
+    if (action === 'admin_main_menu') {
+      clearAdminMode(userId);
+      clearTeacherState(userId);
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_MODE_EXIT }]);
+      sendSuperAdminMainMenu(userId);
+      return;
+    }
+  }
+
+  // ── 4. คำสั่งกลับเมนูหลัก (ข้อความ) ─────────────────────────
+  const backKeywords = ['เมนู', 'menu', 'หน้าหลัก', 'กลับ', 'ออก', 'admin'];
+  if (backKeywords.includes(textLow)) {
+    clearAdminMode(userId);
+    clearTeacherState(userId);
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_MODE_EXIT }]);
+    sendSuperAdminMainMenu(userId);
+    return;
+  }
+
+  // ── 5. Route ตาม Mode ─────────────────────────────────────────
+  const currentMode = getAdminMode(userId);
+  logInfo('SuperAdmin', `Mode: ${currentMode}`, userId);
+
+  switch (currentMode) {
+
+    case SYSTEM_CONFIG.ADMIN_MODE.TEACHER: {
+      // ตรวจสอบว่า Admin ลงทะเบียนเป็นครูแล้วหรือยัง
+      const teacherData = getTeacherByLineId(userId);
+      if (!teacherData) {
+        sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_NO_TEACHER_PROFILE }]);
+        clearAdminMode(userId);
+        sendSuperAdminMainMenu(userId);
+        return;
+      }
+      handleTeacherEvent(event, teacherData);
+      break;
+    }
+
+    case SYSTEM_CONFIG.ADMIN_MODE.MONITOR: {
+      // สร้าง monitorData เสมือน (Virtual) ด้วย Scope = ALL
+      // Admin ไม่จำเป็นต้องอยู่ใน ClassMonitors_Master
+      const monitorData = _buildAdminVirtualMonitorData(userId);
+      handleMonitorEvent(event, monitorData);
+      break;
+    }
+
+    case SYSTEM_CONFIG.ADMIN_MODE.REPORT:
+      handleAdminEvent(event, userInfo.data);
+      break;
+
+    default:
+      // NONE — ยังไม่ได้เลือกโหมด
+      sendSuperAdminMainMenu(userId);
+      break;
+  }
+}
+
+
+/**
+ * สร้าง monitorData เสมือนสำหรับ Admin
+ * มี Scope = ALL เพื่อสร้าง QR ได้ทุกห้อง
+ * ไม่ต้องลงทะเบียนใน ClassMonitors_Master
+ *
+ * @param {string} userId - LINE User ID ของ Admin
+ * @returns {Object} monitorData Object ที่ handleMonitorEvent() รองรับได้
+ * @private
+ */
+function _buildAdminVirtualMonitorData(userId) {
+  return {
+    Monitor_ID:      'ADMIN_' + userId,
+    Student_Name:    'Admin',
+    LINE_User_ID:    userId,
+    Classroom:       'ทุกห้องเรียน',
+    Classroom_Scope: SYSTEM_CONFIG.SCOPE_ALL,
+    Creator_Type:    SYSTEM_CONFIG.CREATOR_TYPE.ADMIN,
+    Status:          'Active',
+    Note:            'Super Admin Virtual Monitor',
+  };
+}
+
+
+/**
+ * จัดการการสลับโหมดของ Admin
+ * เรียกจาก Postback action=admin_switch_mode
+ *
+ * @param {string} userId
+ * @param {string} targetMode - ค่าจาก SYSTEM_CONFIG.ADMIN_MODE
+ */
+function handleAdminModeSwitch(userId, targetMode) {
+  switch (targetMode) {
+
+    case SYSTEM_CONFIG.ADMIN_MODE.TEACHER: {
+      const teacherData = getTeacherByLineId(userId);
+      if (!teacherData) {
+        sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_NO_TEACHER_PROFILE }]);
+        sendSuperAdminMainMenu(userId);
+        return;
+      }
+      saveAdminMode(userId, SYSTEM_CONFIG.ADMIN_MODE.TEACHER);
+      sendLineMessage(userId, [
+        { type: 'text', text: MESSAGES.ADMIN_MODE_TEACHER_ENTER(teacherData['Teacher_Name']) },
+        flexTeacherMenu(teacherData['Teacher_Name']),
+      ]);
+      break;
+    }
+
+    case SYSTEM_CONFIG.ADMIN_MODE.MONITOR: {
+      saveAdminMode(userId, SYSTEM_CONFIG.ADMIN_MODE.MONITOR);
+      const monitorData = _buildAdminVirtualMonitorData(userId);
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_MODE_MONITOR_ENTER }]);
+      // รอ 300ms เล็กน้อยก่อนส่งเมนู Monitor
+      Utilities.sleep(300);
+      sendMonitorMainMenu(userId, monitorData);
+      break;
+    }
+
+    case SYSTEM_CONFIG.ADMIN_MODE.REPORT: {
+      saveAdminMode(userId, SYSTEM_CONFIG.ADMIN_MODE.REPORT);
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ADMIN_MODE_REPORT_ENTER }]);
+      sendAdminMainMenu(userId);
+      break;
+    }
+
+    default:
+      clearAdminMode(userId);
+      sendSuperAdminMainMenu(userId);
+  }
+}
+
+
+/**
+ * ส่งเมนูเลือกโหมดให้ Admin (Super Admin Main Menu)
+ * แสดงเมื่อ Admin ยังไม่ได้เลือกโหมด หรือกด "กลับเมนูหลัก"
+ *
+ * @param {string} userId
+ */
+function sendSuperAdminMainMenu(userId) {
+  sendLineMessage(userId, [
+    flexSuperAdminMenu(),
+    {
+      type: 'text',
+      text: MESSAGES.ADMIN_MODE_PROMPT,
+      quickReply: {
+        items: [
+          {
+            type: 'action',
+            action: {
+              type:        'postback',
+              label:       '📊 โหมดรายงาน',
+              data:        'action=admin_switch_mode&mode=REPORT',
+              displayText: 'เข้าโหมดรายงาน',
+            },
+          },
+          {
+            type: 'action',
+            action: {
+              type:        'postback',
+              label:       '👩‍🏫 โหมดเช็คอิน',
+              data:        'action=admin_switch_mode&mode=TEACHER',
+              displayText: 'เข้าโหมดครูผู้สอน',
+            },
+          },
+          {
+            type: 'action',
+            action: {
+              type:        'postback',
+              label:       '📲 โหมดสร้าง QR',
+              data:        'action=admin_switch_mode&mode=MONITOR',
+              displayText: 'เข้าโหมดสร้าง QR',
+            },
+          },
+        ],
+      },
+    },
+  ]);
+}
+
 
 /**
  * Entry Point สำหรับ Admin
@@ -2434,23 +3010,27 @@ function buildWeeklyReportText(byDay, total) {
 function sendAdminMainMenu(userId) {
   sendLineMessage(userId, [
     flexAdminMenu(),
-    { type: 'text', text: MESSAGES.ADMIN_QUICK_MENU, quickReply: buildAdminQuickReply() },
+    {
+      type: 'text',
+      text: MESSAGES.ADMIN_QUICK_MENU,
+      quickReply: buildAdminReportQuickReply(),
+    },
   ]);
 }
 
 
 /**
- * Quick Reply สำหรับ Admin
- *
- * @returns {Object}
+ * Quick Reply สำหรับ Admin โหมดรายงาน
+ * เพิ่มปุ่ม "🏠 เมนูหลัก" เพื่อกลับไปเลือกโหมดใหม่
  */
-function buildAdminQuickReply() {
+function buildAdminReportQuickReply() {
   return {
     items: [
-      { type: 'action', action: { type: 'postback', label: '📊 สรุปวันนี้',    data: 'action=admin_today_summary',  displayText: 'ดูสรุปวันนี้' } },
-      { type: 'action', action: { type: 'postback', label: '📋 รายละเอียด',    data: 'action=admin_detail_report',  displayText: 'ดูรายละเอียด' } },
-      { type: 'action', action: { type: 'postback', label: '📅 รายสัปดาห์',   data: 'action=admin_weekly_report',  displayText: 'รายงานรายสัปดาห์' } },
-      { type: 'action', action: { type: 'postback', label: '📥 Export',        data: 'action=admin_export',         displayText: 'Export รายงาน' } },
+      { type: 'action', action: { type: 'postback', label: '📊 สรุปวันนี้',  data: 'action=admin_today_summary', displayText: 'ดูสรุปวันนี้' } },
+      { type: 'action', action: { type: 'postback', label: '📋 รายละเอียด', data: 'action=admin_detail_report',  displayText: 'ดูรายละเอียด' } },
+      { type: 'action', action: { type: 'postback', label: '📅 รายสัปดาห์', data: 'action=admin_weekly_report',  displayText: 'รายงานรายสัปดาห์' } },
+      { type: 'action', action: { type: 'postback', label: '📥 Export',      data: 'action=admin_export',         displayText: 'Export รายงาน' } },
+      { type: 'action', action: { type: 'postback', label: '🏠 เมนูหลัก',   data: 'action=admin_main_menu',      displayText: 'กลับเมนูหลัก Admin' } },
     ],
   };
 }
@@ -2524,6 +3104,27 @@ function getTeacherById(teacherId) {
       .find(t => t['Teacher_ID'] === teacherId) || null;
   } catch (e) { logInfo('Sheet', 'ERROR getTeacherById', e.message); return null; }
 }
+
+
+/**
+ * ดึง LINE_User_ID ของครูจาก Teacher_ID
+ * ใช้ตรวจสอบ Self-notification ใน notifyAdminAfterCheckin()
+ *
+ * @param {string} teacherId
+ * @returns {string|null}
+ */
+function getTeacherLineIdByTeacherId(teacherId) {
+  try {
+    const teacher = getTeacherById(teacherId);
+    return (teacher && teacher['LINE_User_ID'])
+      ? teacher['LINE_User_ID'].toString().trim() || null
+      : null;
+  } catch (e) {
+    logInfo('Sheet', 'ERROR getTeacherLineIdByTeacherId', e.message);
+    return null;
+  }
+}
+
 
 /**
  * ค้นหาครูจาก keyword ใน Teacher_Name
@@ -3213,12 +3814,24 @@ function getCheckInsByDateRange(startDate, endDate) {
 
 /**
  * ระบุ Role ของผู้ใช้จาก LINE User ID
- * ลำดับ: Admin → Teacher → Monitor → Unknown
+ *
+ * ลำดับการตรวจสอบ:
+ *   1. Admin (ADMIN_LINE_IDS)       → ADMIN
+ *   2. ทั้ง Teacher + Monitor       → DUAL_ROLE (หัวหน้าระดับชั้น)
+ *   3. Teacher เท่านั้น             → TEACHER
+ *   4. Monitor เท่านั้น             → MONITOR
+ *   5. ไม่พบในระบบ                 → UNKNOWN
  *
  * @param {string} lineUserId
  * @returns {Object} { role, data }
+ *   - ADMIN:     data = { lineUserId, Teacher_Name, Teacher_ID }
+ *   - DUAL_ROLE: data = { teacher: Object, monitor: Object }
+ *   - TEACHER:   data = Object จาก Teachers_Master
+ *   - MONITOR:   data = Object จาก ClassMonitors_Master
+ *   - UNKNOWN:   data = null
  */
 function identifyUserRole(lineUserId) {
+  // ── 1. Admin ─────────────────────────────────────────────────
   if (getAdminLineIds().includes(lineUserId)) {
     return {
       role: SYSTEM_CONFIG.USER_ROLE.ADMIN,
@@ -3230,12 +3843,26 @@ function identifyUserRole(lineUserId) {
     };
   }
 
+  // ── 2 & 3 & 4. ดึงข้อมูลจากทั้งสองชีตพร้อมกัน ───────────────
+  // ดึงพร้อมกันก่อนเพื่อลดจำนวน Sheet Access
   const teacher = getTeacherByLineId(lineUserId);
+  const monitor = getMonitorByLineId(lineUserId);
+
+  // ── 2. Dual-Role: พบทั้ง Teacher และ Monitor ─────────────────
+  if (teacher && monitor) {
+    return {
+      role: SYSTEM_CONFIG.USER_ROLE.DUAL_ROLE,
+      data: { teacher, monitor },
+    };
+  }
+
+  // ── 3. Teacher เท่านั้น ───────────────────────────────────────
   if (teacher) return { role: SYSTEM_CONFIG.USER_ROLE.TEACHER, data: teacher };
 
-  const monitor = getMonitorByLineId(lineUserId);
+  // ── 4. Monitor เท่านั้น ───────────────────────────────────────
   if (monitor) return { role: SYSTEM_CONFIG.USER_ROLE.MONITOR, data: monitor };
 
+  // ── 5. Unknown ───────────────────────────────────────────────
   return { role: SYSTEM_CONFIG.USER_ROLE.UNKNOWN, data: null };
 }
 
@@ -3962,6 +4589,117 @@ function flexAdminMenu() {
           _menuButton('📅 รายงานรายสัปดาห์',  'action=admin_weekly_report',  FLEX_COLORS.NEUTRAL),
           _menuButton('📥 Export รายงาน',      'action=admin_export',         FLEX_COLORS.NEUTRAL),
         ],
+      },
+    },
+  };
+}
+
+
+/**
+ * [SUPER ADMIN] เมนูเลือกโหมดการทำงาน
+ * แสดงตอนที่ Admin ยังไม่ได้เลือกโหมด
+ *
+ * @returns {Object} Flex Message
+ */
+function flexSuperAdminMenu() {
+  return {
+    type: 'flex',
+    altText: '⚙️ Super Admin — เลือกโหมดการทำงานค่ะ',
+    contents: {
+      type: 'bubble',
+      header: {
+        type: 'box', layout: 'vertical',
+        backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
+        contents: [
+          { type: 'text', text: '⚙️ Super Admin', color: FLEX_COLORS.WHITE, size: 'sm' },
+          { type: 'text', text: 'เลือกโหมดการทำงาน', color: FLEX_COLORS.WHITE, size: 'lg', weight: 'bold', margin: 'xs' },
+          { type: 'text', text: SCHOOL_CONFIG.SCHOOL_NAME, color: '#B0BEC5', size: 'xs', margin: 'xs' },
+        ],
+      },
+      body: {
+        type: 'box', layout: 'vertical',
+        spacing: 'sm', paddingAll: '12px',
+        contents: [
+
+          // ── โหมดรายงาน ───────────────────────────────────
+          {
+            type: 'box', layout: 'horizontal',
+            backgroundColor: '#E3F2FD', cornerRadius: '10px',
+            paddingAll: '12px', margin: 'xs', spacing: 'md',
+            action: {
+              type: 'postback', label: 'โหมดรายงาน',
+              data: 'action=admin_switch_mode&mode=REPORT',
+              displayText: 'เข้าโหมดรายงาน',
+            },
+            contents: [
+              { type: 'text', text: '📊', size: 'xl', flex: 0 },
+              {
+                type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: 'โหมดรายงาน', size: 'sm', weight: 'bold', color: FLEX_COLORS.SECONDARY },
+                  { type: 'text', text: 'ดูสรุป / รายงานการเช็คอิน / Export', size: 'xs', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+                ],
+              },
+              { type: 'text', text: '›', size: 'lg', color: FLEX_COLORS.SECONDARY, flex: 0, align: 'end' },
+            ],
+          },
+
+          // ── โหมดครูผู้สอน ─────────────────────────────────
+          {
+            type: 'box', layout: 'horizontal',
+            backgroundColor: '#E8F5E9', cornerRadius: '10px',
+            paddingAll: '12px', margin: 'xs', spacing: 'md',
+            action: {
+              type: 'postback', label: 'โหมดเช็คอิน',
+              data: 'action=admin_switch_mode&mode=TEACHER',
+              displayText: 'เข้าโหมดครูผู้สอน',
+            },
+            contents: [
+              { type: 'text', text: '👩‍🏫', size: 'xl', flex: 0 },
+              {
+                type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: 'โหมดครูผู้สอน', size: 'sm', weight: 'bold', color: FLEX_COLORS.PRIMARY },
+                  { type: 'text', text: 'สแกน QR เช็คอินการเข้าสอน', size: 'xs', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+                ],
+              },
+              { type: 'text', text: '›', size: 'lg', color: FLEX_COLORS.PRIMARY, flex: 0, align: 'end' },
+            ],
+          },
+
+          // ── โหมดสร้าง QR ──────────────────────────────────
+          {
+            type: 'box', layout: 'horizontal',
+            backgroundColor: '#FFF3E0', cornerRadius: '10px',
+            paddingAll: '12px', margin: 'xs', spacing: 'md',
+            action: {
+              type: 'postback', label: 'โหมดสร้าง QR',
+              data: 'action=admin_switch_mode&mode=MONITOR',
+              displayText: 'เข้าโหมดสร้าง QR',
+            },
+            contents: [
+              { type: 'text', text: '📲', size: 'xl', flex: 0 },
+              {
+                type: 'box', layout: 'vertical', flex: 1,
+                contents: [
+                  { type: 'text', text: 'โหมดสร้าง QR', size: 'sm', weight: 'bold', color: FLEX_COLORS.ACCENT },
+                  { type: 'text', text: 'สร้าง QR ให้ครูสแกนได้ทุกห้อง', size: 'xs', color: FLEX_COLORS.TEXT_SUB, wrap: true },
+                ],
+              },
+              { type: 'text', text: '›', size: 'lg', color: FLEX_COLORS.ACCENT, flex: 0, align: 'end' },
+            ],
+          },
+
+        ],
+      },
+      footer: {
+        type: 'box', layout: 'vertical', paddingAll: '10px',
+        contents: [{
+          type: 'text',
+          text: '💡 กดที่การ์ดหรือ Quick Reply\nเพื่อเลือกโหมดการทำงานค่ะ',
+          size: 'xs', color: FLEX_COLORS.NEUTRAL,
+          align: 'center', wrap: true,
+        }],
       },
     },
   };
