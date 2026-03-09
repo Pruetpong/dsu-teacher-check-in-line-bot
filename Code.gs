@@ -2849,7 +2849,7 @@ function handleDetailReport(userId) {
   sendLineMessage(userId, [{
     type: 'text',
     text: MESSAGES.ADMIN_MORE_REPORT,
-    quickReply: buildAdminQuickReply(),
+    quickReply: buildAdminReportQuickReply(),
   }]);
 }
 
@@ -4267,7 +4267,7 @@ function flexClassInfo(qrData, teacher) {
               type: 'postback',
               label: '✅ เข้าสอน',
               data: 'action=confirm_teaching',
-              displayText: 'ยืนยันเข้าสอนค่ะ',
+              displayText: 'ยืนยันเข้าสอน',
             },
           },
         ],
