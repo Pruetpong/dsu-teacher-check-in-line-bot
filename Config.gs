@@ -34,7 +34,7 @@ const SCHOOL_CONFIG = {
   // เวลาทำการของระบบ
   // นอกช่วงนี้ระบบยังทำงานได้ปกติ แต่ใช้สำหรับ Validation ใน Future Feature
   SCHOOL_DAY_START: '06:00',
-  SCHOOL_DAY_END:   '20:00',
+  SCHOOL_DAY_END:   '18:00',
 };
 
 
@@ -422,7 +422,7 @@ const MESSAGES = {
     `กรุณาตรวจสอบและลงทะเบียน\n` +
     `ใน Google Sheets ด้วยนะคะ 📋`,
 
-  // --- Check-in / Teaching Flow (ใหม่) ---
+  // --- Check-in / Teaching Flow ---
   REMIND_PRESS_TEACHING_BUTTON:
     'ป้าไพรรออยู่นะคะ 😊\n\n' +
     '👆 กรุณากดปุ่ม "✅ เข้าสอน" หรือ "❌ ยกเลิก"\n' +
@@ -452,7 +452,7 @@ const MESSAGES = {
     `กรุณากดปุ่ม "📤 เช็คเอาท์"\n` +
     `เพื่อบันทึกข้อมูลก่อนนะคะ 🙏`,
 
-  // --- Checkout Flow (ใหม่) ---
+  // --- Checkout Flow ---
   ASK_CHECKOUT_TOPIC:
     '📝 ป้าไพรขอถามหน่อยนะคะ\n\n' +
     'วันนี้สอนเรื่องอะไรคะ?\n' +
