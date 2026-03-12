@@ -1217,11 +1217,8 @@ function handleTeacherEvent(event, teacherData) {
     } else if (event.type === 'postback') {
       handleTeacherPostback(event, teacherData);
     } else {
-      // ถ้ากำลังกรอกข้อมูลอยู่ → เตือนให้พิมพ์ตามแต่ละ State
       const state = getTeacherState(event.source.userId);
-      if (state && state.step === SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
-        handleTeacherBlockedInTeaching(event.source.userId, state);
-      } else if (state && state.step !== SYSTEM_CONFIG.TEACHER_STATE.IDLE) {
+      if (state && state.step !== SYSTEM_CONFIG.TEACHER_STATE.IDLE) {
         remindTeacherToType(event.source.userId, state);
       } else {
         sendTeacherMainMenu(event.source.userId, teacherData);
@@ -1276,18 +1273,12 @@ function handleTeacherMessage(event, teacherData) {
 
   switch (step) {
     case SYSTEM_CONFIG.TEACHER_STATE.SCANNED:
-      // รอกดปุ่ม — ถ้าพิมพ์ข้อความแทนให้เตือน
+      // รอกดปุ่ม "เข้าสอน" — ถ้าพิมพ์ข้อความแทนให้เตือน
       remindTeacherToType(userId, currentState);
       break;
-    case SYSTEM_CONFIG.TEACHER_STATE.TEACHING:
-      // กำลังสอนอยู่ — Block ทุกข้อความ (ยกเว้น /help, /status, ยกเลิก ที่จัดการไปก่อนแล้ว)
-      handleTeacherBlockedInTeaching(userId, currentState);
-      break;
-    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC:
-      handleTopicInput(userId, teacherData, text, currentState);
-      break;
-    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_ASSIGNMENT:
-      handleAssignmentInput(userId, teacherData, text, currentState);
+    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_INPUT:
+      // รอรับ Topic + Assignment
+      handleCombinedInput(userId, teacherData, text, currentState);
       break;
     case SYSTEM_CONFIG.TEACHER_STATE.CONFIRM:
       remindTeacherToUseButton(userId);
@@ -1311,11 +1302,8 @@ function handleTeacherPostback(event, teacherData) {
   const action = params['action'];
 
   switch (action) {
-    case 'confirm_teaching':      // ← ใหม่: ครูกดปุ่ม "เข้าสอน"
+    case 'confirm_teaching':
       handleConfirmTeaching(userId, teacherData);
-      break;
-    case 'request_checkout':      // ← ใหม่: ครูกดปุ่ม "เช็คเอาท์"
-      handleCheckoutRequest(userId, teacherData);
       break;
     case 'confirm_checkin':
       handleConfirmCheckin(userId, teacherData);
@@ -1325,6 +1313,10 @@ function handleTeacherPostback(event, teacherData) {
       break;
     case 'teacher_history':
       handleViewHistory(userId, teacherData);
+      break;
+    case 'cancel_checkin':
+      clearTeacherState(userId);
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.CANCEL_CHECKIN }]);
       break;
     default:
       sendTeacherMainMenu(userId, teacherData);
@@ -1343,37 +1335,7 @@ function handleTeacherPostback(event, teacherData) {
 function handleQRScan(userId, teacherData, token) {
   logInfo('Teacher', `สแกน Token: ${token}`, teacherData['Teacher_Name']);
 
-  // ── 1. ตรวจสอบ State TEACHING ก่อนเลย ───────────────────
-  const existingState = getTeacherState(userId);
-  if (existingState && existingState.step === SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
-    const qrData = existingState.qrData;
-    const periodLabel = qrData
-      ? buildPeriodLabel(
-          qrData['Period_Name'],
-          Number(qrData['Period_End_Number'] || qrData['Period_Number']),
-          Number(qrData['Period_Number'])
-        )
-      : 'คาบที่กำลังสอนอยู่';
-    sendLineMessage(userId, [{
-      type: 'text',
-      text: MESSAGES.QR_BLOCKED_IN_TEACHING(periodLabel),
-      quickReply: {
-        items: [{
-          type: 'action',
-          action: {
-            type: 'postback',
-            label: '📤 เช็คเอาท์',
-            data: 'action=request_checkout',
-            displayText: 'เช็คเอาท์หลังสอนเสร็จ',
-          },
-        }],
-      },
-    }]);
-    return;
-  }
-  // ────────────────────────────────────────────────────────
-
-  // ── 2. ตรวจสอบ QR Token ──────────────────────────────────
+  // ── 1. ตรวจสอบ QR Token ──────────────────────────────────
   const validation = validateQRToken(token);
   if (!validation.valid) {
     const msgMap = {
@@ -1417,8 +1379,8 @@ function handleQRScan(userId, teacherData, token) {
 
 
 /**
- * ครูกดปุ่ม "เข้าสอน" → บันทึกเวลาเข้าสอน → เปลี่ยน State เป็น TEACHING
- * State: SCANNED → TEACHING
+ * ครูกดปุ่ม "เข้าสอน" → บันทึกเวลาเข้า → เปลี่ยน State เป็น WAITING_INPUT ทันที
+ * State: SCANNED → WAITING_INPUT
  *
  * @param {string} userId
  * @param {Object} teacherData
@@ -1434,155 +1396,49 @@ function handleConfirmTeaching(userId, teacherData) {
   const qrData      = currentState.qrData;
   const checkinTime = new Date();
 
-  // คำนวณ Status (ตรงเวลา / สาย) ณ ตอนกดเข้าสอน
+  // คำนวณ checkinStatus (ตรงเวลา / สาย) ณ ตอนกดเข้าสอน
+  // ใช้ชื่อ checkinStatus เพื่อไม่ชนกับ key 'status' ที่ใช้เก็บ ON_TIME/LATE ใน checkinData
   const period = getPeriodByNumber(Number(qrData['Period_Number']));
-  let status   = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+  let checkinStatus = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
   if (period) {
     const [sh, sm] = period.start.split(':').map(Number);
     const graceEnd = new Date();
     graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
-    if (checkinTime > graceEnd) status = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
+    if (checkinTime > graceEnd) checkinStatus = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
   }
 
-  // บันทึก State = TEACHING พร้อม checkinTime และ status
+  // บันทึก State = WAITING_INPUT พร้อม checkinTime และ checkinStatus
   saveTeacherState(userId, {
     ...currentState,
-    step:        SYSTEM_CONFIG.TEACHER_STATE.TEACHING,
-    checkinTime: checkinTime.toISOString(),
-    status:      status,
+    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_INPUT,
+    checkinTime:   checkinTime.toISOString(),
+    checkinStatus: checkinStatus,
   });
 
-  const periodLabel = buildPeriodLabel(
-    qrData['Period_Name'],
-    Number(qrData['Period_End_Number'] || qrData['Period_Number']),
-    Number(qrData['Period_Number'])
-  );
+  logInfo('Teacher', `✅ เข้าสอน: ${teacherData['Teacher_Name']}`);
 
-  // ส่งข้อความยืนยัน + Quick Reply ปุ่มเช็คเอาท์
+  // ส่งข้อความขอข้อมูลการสอนทันที
   sendLineMessage(userId, [{
     type: 'text',
-    text: MESSAGES.TEACHING_STARTED(periodLabel),
-    quickReply: {
-      items: [{
-        type: 'action',
-        action: {
-          type: 'postback',
-          label: '📤 เช็คเอาท์',
-          data: 'action=request_checkout',
-          displayText: 'เช็คเอาท์หลังสอนเสร็จ',
-        },
-      }],
-    },
-  }]);
-
-  logInfo('Teacher', `✅ เข้าสอน: ${teacherData['Teacher_Name']} — ${periodLabel}`);
-}
-
-
-/**
- * ครูกดปุ่ม "เช็คเอาท์" → เปลี่ยน State เป็น WAITING_TOPIC
- * State: TEACHING → WAITING_TOPIC
- *
- * @param {string} userId
- * @param {Object} teacherData
- */
-function handleCheckoutRequest(userId, teacherData) {
-  const currentState = getTeacherState(userId);
-  if (!currentState || currentState.step !== SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
-    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.SESSION_TIMEOUT }]);
-    clearTeacherState(userId);
-    return;
-  }
-
-  // เก็บ checkinTime และ status ไว้ใน State เดิม
-  saveTeacherState(userId, {
-    ...currentState,
-    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC,
-    teachingTopic: '',
-    assignment:    '',
-  });
-
-  sendLineMessage(userId, [{
-    type: 'text',
-    text: MESSAGES.ASK_CHECKOUT_TOPIC,
-    quickReply: {
-      items: [{
-        type: 'action',
-        action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
-      }],
-    },
-  }]);
-}
-
-
-/**
- * ครูพิมพ์ข้อความหรือส่ง Sticker ขณะอยู่ใน State TEACHING
- * → Block + แสดงปุ่มเช็คเอาท์ทุกครั้ง
- *
- * @param {string} userId
- * @param {Object} state - current teacher state
- */
-function handleTeacherBlockedInTeaching(userId, state) {
-  const qrData = state ? state.qrData : null;
-  const periodLabel = qrData
-    ? buildPeriodLabel(
-        qrData['Period_Name'],
-        Number(qrData['Period_End_Number'] || qrData['Period_Number']),
-        Number(qrData['Period_Number'])
-      )
-    : 'คาบที่กำลังสอนอยู่';
-
-  sendLineMessage(userId, [{
-    type: 'text',
-    text: MESSAGES.BLOCKED_IN_TEACHING(periodLabel),
-    quickReply: {
-      items: [{
-        type: 'action',
-        action: {
-          type: 'postback',
-          label: '📤 เช็คเอาท์',
-          data: 'action=request_checkout',
-          displayText: 'เช็คเอาท์หลังสอนเสร็จ',
-        },
-      }],
-    },
-  }]);
-}
-
-
-/**
- * รับ "เรื่องที่สอน" จากครู
- * State: WAITING_TOPIC → WAITING_ASSIGNMENT
- *
- * @param {string} userId
- * @param {Object} teacherData
- * @param {string} text
- * @param {Object} currentState
- */
-function handleTopicInput(userId, teacherData, text, currentState) {
-  if (!text || text.length < 3) {
-    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.TOPIC_TOO_SHORT }]);
-    return;
-  }
-
-  saveTeacherState(userId, {
-    ...currentState,
-    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_ASSIGNMENT,
-    teachingTopic: text,
-  });
-
-  sendLineMessage(userId, [{
-    type: 'text',
-    text: MESSAGES.ASK_ASSIGNMENT,
+    text: MESSAGES.ASK_COMBINED_INPUT,
     quickReply: {
       items: [
         {
           type: 'action',
-          action: { type: 'message', label: '📭 ไม่มีงานมอบหมาย', text: 'ไม่มีงานมอบหมาย' },
+          action: {
+            type:  'message',
+            label: '📭 ไม่มีงานมอบหมาย',
+            text:  '__NO_ASSIGNMENT__',
+          },
         },
         {
           type: 'action',
-          action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+          action: {
+            type:        'postback',
+            label:       '❌ ยกเลิก',
+            data:        'action=cancel_checkin',
+            displayText: 'ยกเลิกการเช็คอิน',
+          },
         },
       ],
     },
@@ -1591,56 +1447,136 @@ function handleTopicInput(userId, teacherData, text, currentState) {
 
 
 /**
- * รับ "งานมอบหมาย" จากครู
- * State: WAITING_ASSIGNMENT → CONFIRM
+ * รับ Topic + Assignment ในข้อความเดียว
+ * State: WAITING_INPUT → CONFIRM
+ *
+ * รูปแบบที่รองรับ:
+ *   "__NO_ASSIGNMENT__"          → flag ไม่มีงาน แล้วถามเรื่องที่สอนอีกครั้ง
+ *   "อสมการ"                    → topic=อสมการ, assignment=""
+ *   "อสมการ\nแบบฝึกหัด 3.2"    → topic=อสมการ, assignment=แบบฝึกหัด 3.2
+ *   "อสมการ | แบบฝึกหัด 3.2"   → topic=อสมการ, assignment=แบบฝึกหัด 3.2
  *
  * @param {string} userId
  * @param {Object} teacherData
  * @param {string} text
  * @param {Object} currentState
  */
-function handleAssignmentInput(userId, teacherData, text, currentState) {
-  const noAssignmentKeywords = ['ไม่มีงานมอบหมาย', 'ไม่มีงาน', 'ไม่มี', '-', 'none'];
-  const assignment = noAssignmentKeywords.includes(text.toLowerCase()) ? '' : text;
+function handleCombinedInput(userId, teacherData, text, currentState) {
+  try {
+    // กรณีกด Quick Reply "ไม่มีงานมอบหมาย" ก่อนพิมพ์ topic → set flag แล้วถาม topic อีกครั้ง
+    if (text === '__NO_ASSIGNMENT__') {
+      saveTeacherState(userId, {
+        ...currentState,
+        noAssignment: true,
+      });
+      sendLineMessage(userId, [{
+        type: 'text',
+        text: '📝 สอนเรื่องอะไรคะ?\nพิมพ์ชื่อเรื่องที่สอนในคาบนี้ได้เลยค่ะ 😊',
+        quickReply: {
+          items: [
+            { type: 'action', action: { type: 'message', label: '📖 ทบทวนบทเรียน',   text: 'ทบทวนบทเรียน' } },
+            { type: 'action', action: { type: 'message', label: '📚 บทเรียนใหม่',     text: 'แนะนำบทเรียนใหม่' } },
+            { type: 'action', action: { type: 'message', label: '📝 สอบ/ทดสอบ',      text: 'สอบ/ทดสอบ' } },
+            { type: 'action', action: { type: 'message', label: '🎯 กิจกรรม',         text: 'กิจกรรมการเรียนรู้' } },
+          ],
+        },
+      }]);
+      return;
+    }
 
-  const qrData = currentState.qrData;
-  const period = getPeriodByNumber(Number(qrData['Period_Number']));
+    // Parse topic และ assignment จากข้อความที่ครูพิมพ์
+    const parsed     = parseCombinedInput(text, currentState.noAssignment);
+    const topic      = parsed.topic.trim();
+    const assignment = parsed.assignment.trim();
 
-  const periodEndNumber = Number(qrData['Period_End_Number'] || qrData['Period_Number']);
-  const periodEnd       = getPeriodByNumber(periodEndNumber);
-  const periodLabel     = buildPeriodLabel(
-    qrData['Period_Name'],
-    periodEndNumber,
-    Number(qrData['Period_Number'])
-  );
+    // Validate: topic ต้องไม่ว่างและยาวพอ
+    if (!topic || topic.length < 3) {
+      sendLineMessage(userId, [{ type: 'text', text: MESSAGES.REMIND_TYPE_INPUT }]);
+      return;
+    }
 
-  const checkinData = {
-    teacherName:     teacherData['Teacher_Name'],
-    teacherId:       teacherData['Teacher_ID'],
-    subjectCode:     qrData['Subject_Code'],
-    subjectName:     qrData['Subject_Name'] || qrData['Subject_Code'],
-    classroom:       qrData['Classroom'],
-    periodNumber:    Number(qrData['Period_Number']),
-    periodEndNumber: periodEndNumber,                          // ← ใหม่
-    periodName:      periodLabel,
-    timeStart:       period    ? period.start    : '-',
-    timeEnd:         periodEnd ? periodEnd.end   : '-',        // ← ใหม่: ใช้เวลาสิ้นสุดของคาบสุดท้าย
-    day:             getTodayDayName(),
-    teachingTopic:   currentState.teachingTopic,
-    assignment:      assignment,
-    token:           currentState.token,
-    checkinTime:     currentState.checkinTime || new Date().toISOString(), // ← ใหม่
-    status:          currentState.status || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME, // ← ใหม่
-  };
+    // สร้าง checkinData Object ครบถ้วนสำหรับ flexCheckinConfirm และ handleConfirmCheckin
+    const qrData          = currentState.qrData;
+    const period          = getPeriodByNumber(Number(qrData['Period_Number']));
+    const periodEndNumber = Number(qrData['Period_End_Number'] || qrData['Period_Number']);
+    const periodEnd       = getPeriodByNumber(periodEndNumber);
+    const periodLabel     = buildPeriodLabel(
+      qrData['Period_Name'],
+      periodEndNumber,
+      Number(qrData['Period_Number'])
+    );
 
-  saveTeacherState(userId, {
-    ...currentState,
-    step:        SYSTEM_CONFIG.TEACHER_STATE.CONFIRM,
-    assignment:  assignment,
-    checkinData: checkinData,
-  });
+    const checkinData = {
+      teacherName:     teacherData['Teacher_Name'],
+      teacherId:       teacherData['Teacher_ID'],
+      subjectCode:     qrData['Subject_Code'],
+      subjectName:     qrData['Subject_Name'] || qrData['Subject_Code'],
+      classroom:       qrData['Classroom'],
+      periodNumber:    Number(qrData['Period_Number']),
+      periodEndNumber: periodEndNumber,
+      periodName:      periodLabel,
+      timeStart:       period    ? period.start  : '-',
+      timeEnd:         periodEnd ? periodEnd.end : '-',
+      day:             getTodayDayName(),
+      teachingTopic:   topic,
+      assignment:      assignment,
+      token:           currentState.token,
+      checkinTime:     currentState.checkinTime     || new Date().toISOString(),
+      checkinStatus:   currentState.checkinStatus   || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME,
+    };
 
-  sendLineMessage(userId, [flexCheckinConfirm(checkinData)]);
+    // เปลี่ยน State เป็น CONFIRM
+    saveTeacherState(userId, {
+      ...currentState,
+      step:         SYSTEM_CONFIG.TEACHER_STATE.CONFIRM,
+      noAssignment: undefined,
+      checkinData:  checkinData,
+    });
+
+    sendLineMessage(userId, [flexCheckinConfirm(checkinData)]);
+
+  } catch (e) {
+    logInfo('Teacher', 'ERROR handleCombinedInput', e.message);
+    sendLineMessage(userId, [{ type: 'text', text: MESSAGES.ERROR_GENERAL }]);
+  }
+}
+
+
+/**
+ * แยก Topic และ Assignment จากข้อความของครู
+ *
+ * @param {string}  text              - ข้อความจากครู
+ * @param {boolean} noAssignmentFlag  - true ถ้าครูกด "ไม่มีงาน" ไว้ก่อน
+ * @returns {{ topic: string, assignment: string }}
+ */
+function parseCombinedInput(text, noAssignmentFlag) {
+  if (!text) return { topic: '', assignment: '' };
+
+  // ถ้ามี flag ไม่มีงาน → ข้อความที่ได้รับคือ topic ล้วน ๆ
+  if (noAssignmentFlag) {
+    return { topic: text.trim(), assignment: '' };
+  }
+
+  // ลอง split ด้วย | (pipe) ก่อน
+  if (text.includes('|')) {
+    const parts = text.split('|');
+    return {
+      topic:      (parts[0] || '').trim(),
+      assignment: (parts[1] || '').trim(),
+    };
+  }
+
+  // ลอง split ด้วย newline
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l !== '');
+  if (lines.length >= 2) {
+    return {
+      topic:      lines[0],
+      assignment: lines.slice(1).join(', '),
+    };
+  }
+
+  // บรรทัดเดียว → topic เท่านั้น ไม่มีงาน
+  return { topic: text.trim(), assignment: '' };
 }
 
 
@@ -1677,11 +1613,8 @@ function handleConfirmCheckin(userId, teacherData) {
   // ────────────────────────────────────────────────────────
 
   try {
-    const checkoutTime    = new Date();
-    const checkinTime     = checkinData.checkinTime
-      ? new Date(checkinData.checkinTime)
-      : checkoutTime;
-    const durationMinutes = Math.round((checkoutTime - checkinTime) / 60000);
+    // EDIT-K10: Flow ใหม่ไม่มี Checkout แล้ว — บันทึกทันทีเมื่อยืนยัน
+    const completedAt = new Date();
 
     const success = saveCheckIn({
       teacherId:       checkinData.teacherId,
@@ -1690,7 +1623,7 @@ function handleConfirmCheckin(userId, teacherData) {
       subjectName:     checkinData.subjectName,
       classroom:       checkinData.classroom,
       periodNumber:    checkinData.periodNumber,
-      periodEndNumber: checkinData.periodEndNumber,            // ← ใหม่
+      periodEndNumber: checkinData.periodEndNumber,
       periodName:      checkinData.periodName,
       timeStart:       checkinData.timeStart,
       timeEnd:         checkinData.timeEnd,
@@ -1698,11 +1631,11 @@ function handleConfirmCheckin(userId, teacherData) {
       teachingTopic:   checkinData.teachingTopic,
       assignment:      checkinData.assignment,
       qrToken:         checkinData.token,
-      status:          checkinData.status || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME,
-      checkinTime:     checkinTime,                            // ← ใหม่
-      checkoutTime:    checkoutTime,                           // ← ใหม่
-      durationMinutes: durationMinutes,                        // ← ใหม่
-      checkoutStatus:  SYSTEM_CONFIG.CHECKOUT_STATUS.COMPLETED, // ← ใหม่
+      status:          checkinData.checkinStatus || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME,
+      checkinTime:     checkinData.checkinTime ? new Date(checkinData.checkinTime) : completedAt,
+      checkoutTime:    completedAt,
+      durationMinutes: 0,
+      checkoutStatus:  'Completed',
     });
 
     if (!success) throw new Error('saveCheckIn returned false');
@@ -1711,11 +1644,7 @@ function handleConfirmCheckin(userId, teacherData) {
 
     // แสดงผลสำเร็จ
     sendLineMessage(userId, [
-      flexCheckinSuccess({
-        ...checkinData,
-        checkoutTime:    checkoutTime,
-        durationMinutes: durationMinutes,
-      }),
+      flexCheckinSuccess(checkinData, completedAt),
       {
         type: 'text',
         text: 'ขอบคุณสำหรับการบันทึกนะคะ 🙏\nมีอะไรให้ป้าไพรช่วยเพิ่มเติมไหมคะ 😊',
@@ -1745,7 +1674,7 @@ function handleConfirmCheckin(userId, teacherData) {
 
     // แจ้ง Monitor และ Admin
     notifyMonitorAfterCheckin(checkinData, currentState.qrData);
-    notifyAdminAfterCheckin(checkinData, checkinData.status);
+    notifyAdminAfterCheckin(checkinData, checkinData.checkinStatus);
 
     clearTeacherState(userId);
 
@@ -1773,20 +1702,29 @@ function handleEditCheckin(userId, teacherData) {
 
   saveTeacherState(userId, {
     ...currentState,
-    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC,
-    teachingTopic: '',
-    assignment:    '',
-    checkinData:   null,
+    step:         SYSTEM_CONFIG.TEACHER_STATE.WAITING_INPUT,
+    checkinData:  null,
+    noAssignment: undefined,
   });
 
   sendLineMessage(userId, [{
     type: 'text',
-    text: MESSAGES.EDIT_CHECKIN + MESSAGES.ASK_CHECKOUT_TOPIC,
+    text: MESSAGES.EDIT_CHECKIN + MESSAGES.ASK_COMBINED_INPUT,
     quickReply: {
-      items: [{
-        type: 'action',
-        action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
-      }],
+      items: [
+        {
+          type: 'action',
+          action: {
+            type:  'message',
+            label: '📭 ไม่มีงานมอบหมาย',
+            text:  '__NO_ASSIGNMENT__',
+          },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
+        },
+      ],
     },
   }]);
 }
@@ -1982,12 +1920,6 @@ function handleTeacherKeyword(userId, teacherData, text) {
 function handleTeacherCancel(userId, teacherData) {
   const currentState = getTeacherState(userId);
 
-  // ถ้าอยู่ใน TEACHING → ไม่อนุญาตให้ยกเลิก ต้อง Checkout ก่อน
-  if (currentState && currentState.step === SYSTEM_CONFIG.TEACHER_STATE.TEACHING) {
-    handleTeacherBlockedInTeaching(userId, currentState);
-    return;
-  }
-
   clearTeacherState(userId);
   sendLineMessage(userId, [{ type: 'text', text: MESSAGES.CANCEL_CHECKIN }]);
 }
@@ -2016,11 +1948,11 @@ function remindTeacherToType(userId, state) {
     case SYSTEM_CONFIG.TEACHER_STATE.SCANNED:
       msg = MESSAGES.REMIND_PRESS_TEACHING_BUTTON;
       break;
-    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC:
-      msg = MESSAGES.REMIND_TYPE_TOPIC;
+    case SYSTEM_CONFIG.TEACHER_STATE.WAITING_INPUT:
+      msg = MESSAGES.REMIND_TYPE_INPUT;
       break;
     default:
-      msg = MESSAGES.REMIND_TYPE_ASSIGNMENT;
+      msg = MESSAGES.REMIND_TYPE_INPUT;
   }
   sendLineMessage(userId, [{ type: 'text', text: msg }]);
 }
@@ -3788,7 +3720,7 @@ function saveCheckIn(params) {
       params.checkinTime     || now,                                    // Col 18: Checkin_Time ← ใหม่
       params.checkoutTime    || now,                                    // Col 19: Checkout_Time ← ใหม่
       params.durationMinutes != null ? params.durationMinutes : '',     // Col 20: Duration_Minutes ← ใหม่
-      params.checkoutStatus  || SYSTEM_CONFIG.CHECKOUT_STATUS.COMPLETED,// Col 21: Checkout_Status ← ใหม่
+      params.checkoutStatus  || 'Completed',                             // Col 21: Checkout_Status
     ]);
 
     logInfo('Sheet', `บันทึกเช็คอิน: ${params.teacherName} — ${params.subjectName}`);
@@ -4334,24 +4266,19 @@ function flexCheckinConfirm(checkinData) {
 
 
 /**
- * [TEACHER] แจ้งผลเช็คอินสำเร็จ
+ * [TEACHER] แจ้งผลบันทึกการสอนสำเร็จ — Flow ใหม่ไม่แสดง Duration/Checkout
  *
- * @param {Object} checkinData (รวม status แล้ว)
- * @returns {Object}
+ * @param {Object} checkinData  - ข้อมูลการเช็คอิน (มี checkinStatus แทน status)
+ * @param {Date}   completedAt  - เวลาที่กดยืนยัน
+ * @returns {Object} Flex Message
  */
-function flexCheckinSuccess(checkinData) {
-  const isOnTime    = checkinData.status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+function flexCheckinSuccess(checkinData, completedAt) {
+  const isOnTime    = checkinData.checkinStatus === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
   const statusColor = isOnTime ? FLEX_COLORS.PRIMARY : FLEX_COLORS.WARNING;
   const statusIcon  = isOnTime ? '✅' : '⚠️';
-
-  const checkinStr  = checkinData.checkinTime
-    ? new Date(checkinData.checkinTime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
-    : '-';
-  const checkoutStr = checkinData.checkoutTime
-    ? new Date(checkinData.checkoutTime).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
-    : '-';
-  const durationText = checkinData.durationMinutes != null
-    ? `${checkinData.durationMinutes} นาที`
+  const statusLabel = checkinData.checkinStatus || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+  const timeStr     = completedAt
+    ? completedAt.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' })
     : '-';
 
   return {
@@ -4367,17 +4294,13 @@ function flexCheckinSuccess(checkinData) {
             contents: [
               { type: 'text', text: statusIcon, size: '5xl', align: 'center' },
               { type: 'text', text: 'บันทึกการสอนสำเร็จ!', size: 'lg', weight: 'bold', color: statusColor, align: 'center', margin: 'md' },
-              { type: 'text', text: checkinData.status || '', size: 'sm', color: statusColor, align: 'center' },
+              { type: 'text', text: statusLabel, size: 'sm', color: statusColor, align: 'center' },
             ],
           },
           { type: 'separator', margin: 'lg' },
-          _infoRow('📚', 'วิชา',        checkinData.subjectName   || '-'),
-          _infoRow('🕐', 'คาบ',         checkinData.periodName    || '-'),
-          _infoRow('🏫', 'ห้องเรียน',   checkinData.classroom     || '-'),
-          { type: 'separator', margin: 'md' },
-          _infoRow('🟢', 'เวลาเข้าสอน', `${checkinStr} น.`),
-          _infoRow('🔴', 'เวลาออก',     `${checkoutStr} น.`),
-          _infoRow('⏱️', 'รวมเวลาสอน',  durationText),
+          _infoRow('📚', 'วิชา',       checkinData.subjectName || '-'),
+          _infoRow('🕐', 'คาบ',        checkinData.periodName  || '-'),
+          _infoRow('🏫', 'ห้องเรียน',  checkinData.classroom   || '-'),
           { type: 'separator', margin: 'md' },
           {
             type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.LIGHT_BG, cornerRadius: '8px', paddingAll: '10px', margin: 'sm',
@@ -4393,6 +4316,7 @@ function flexCheckinSuccess(checkinData) {
               { type: 'text', text: checkinData.assignment || 'ไม่มีงานมอบหมาย', size: 'sm', color: checkinData.assignment ? FLEX_COLORS.TEXT_MAIN : FLEX_COLORS.TEXT_SUB, wrap: true, margin: 'xs' },
             ],
           },
+          _infoRow('🕐', 'บันทึกเมื่อ', `${timeStr} น.`),
           { type: 'text', text: 'ขอบคุณค่ะ 🙏', size: 'sm', color: FLEX_COLORS.NEUTRAL, align: 'center', margin: 'md' },
         ],
       },
@@ -5360,7 +5284,7 @@ function systemHealthCheck() {
 function testStateCache() {
   const testId = 'U_TEST_CACHE_99999';
 
-  const state = { step: SYSTEM_CONFIG.TEACHER_STATE.WAITING_TOPIC, token: 'TEST_ABC', teachingTopic: '' };
+  const state = { step: SYSTEM_CONFIG.TEACHER_STATE.WAITING_INPUT, token: 'TEST_ABC' };
   saveTeacherState(testId, state);
 
   const got = getTeacherState(testId);
