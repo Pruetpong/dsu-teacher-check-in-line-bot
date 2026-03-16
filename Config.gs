@@ -707,6 +707,46 @@ function buildPeriodLabel(periodName, periodEndNumber, periodStartNumber) {
 
 
 /**
+ * คำนวณเวลาเช็คเอาท์จำลองและระยะเวลาสอนมาตรฐานตามตาราง
+ * ใช้บันทึกลง Teacher_CheckIn_Log แทนค่า 0
+ * เพื่อให้ข้อมูลสมบูรณ์สำหรับการวิเคราะห์และ Dashboard
+ *
+ * ตัวอย่าง:
+ *   checkinTime  = 08:18 (เวลาสแกน QR จริง)
+ *   timeEndString = "09:55" (เวลาจบคาบคู่ 3–4)
+ *   → checkoutTime   = วันนี้ 09:55:00
+ *   → durationMinutes = 97 นาที
+ *
+ * @param {string} timeEndString - เวลาจบคาบจาก PERIODS เช่น "09:55"
+ * @param {Date}   checkinTime   - เวลาที่ครูสแกน QR Code สำเร็จ (Date object)
+ * @returns {{ checkoutTime: Date, durationMinutes: number }}
+ */
+function buildSimulatedCheckout(timeEndString, checkinTime) {
+  try {
+    if (!timeEndString || !checkinTime) {
+      return { checkoutTime: new Date(checkinTime), durationMinutes: 0 };
+    }
+    const parts = timeEndString.split(':').map(Number);
+    if (parts.length < 2 || isNaN(parts[0]) || isNaN(parts[1])) {
+      logInfo('Helper', 'WARN buildSimulatedCheckout: timeEndString ผิดรูปแบบ', timeEndString);
+      return { checkoutTime: new Date(checkinTime), durationMinutes: 0 };
+    }
+    const [endH, endM] = parts;
+    const checkoutTime = new Date(checkinTime);
+    checkoutTime.setHours(endH, endM, 0, 0);
+
+    const durationMs      = checkoutTime - new Date(checkinTime);
+    const durationMinutes = durationMs > 0 ? Math.round(durationMs / 60000) : 0;
+
+    return { checkoutTime, durationMinutes };
+  } catch (e) {
+    logInfo('Helper', 'ERROR buildSimulatedCheckout', e.message);
+    return { checkoutTime: new Date(checkinTime), durationMinutes: 0 };
+  }
+}
+
+
+/**
  * แปลงชื่อวันในสัปดาห์เป็นภาษาไทย
  * ใช้ Query ตารางสอนใน Subjects_Schedule
  *
