@@ -1365,15 +1365,60 @@ function handleQRScan(userId, teacherData, token) {
     return;
   }
 
-  // ── 3. บันทึก State = SCANNED รอครูกดปุ่ม "เข้าสอน" ──────
+  // ── 3. Stamp เวลาและคำนวณสถานะ ณ วินาทีที่สแกนผ่าน ──────
+  // ล็อคเวลา ณ จุดนี้ทันที เพื่อความเป็นธรรม
+  // ไม่ว่าครูจะใช้เวลาพิมพ์เรื่องที่สอนนานแค่ไหนก็ตาม
+  const checkinTime       = new Date();
+  const periodForStatus   = getPeriodByNumber(Number(qrData['Period_Number']));
+  let   checkinStatus     = SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME;
+  if (periodForStatus) {
+    const [sh, sm] = periodForStatus.start.split(':').map(Number);
+    const graceEnd = new Date();
+    graceEnd.setHours(sh, sm + SYSTEM_CONFIG.CHECKIN_GRACE_MINUTES, 0, 0);
+    if (checkinTime > graceEnd) checkinStatus = SYSTEM_CONFIG.CHECKIN_STATUS.LATE;
+  }
+
+  // ── 4. บันทึก State = WAITING_INPUT ทันที (ข้าม SCANNED) ──
+  // ลดขั้นตอนการกดปุ่ม "เข้าสอน" ที่ซ้ำซ้อน
   saveTeacherState(userId, {
-    step:   SYSTEM_CONFIG.TEACHER_STATE.SCANNED,
-    token:  token,
-    qrData: qrData,
+    step:          SYSTEM_CONFIG.TEACHER_STATE.WAITING_INPUT,
+    token:         token,
+    qrData:        qrData,
+    checkinTime:   checkinTime.toISOString(),
+    checkinStatus: checkinStatus,
   });
 
-  // แสดง Card ข้อมูลคาบ พร้อมปุ่ม "เข้าสอน" และ "ยกเลิก"
-  sendLineMessage(userId, [flexClassInfo(qrData, teacherData)]);
+  logInfo('Teacher', `✅ สแกนผ่าน | Stamp: ${checkinStatus}`, teacherData['Teacher_Name']);
+
+  // ── 5. แสดงข้อมูลคาบ และถามเรื่องที่สอนทันที ────────────
+  sendLineMessage(userId, [
+    flexClassInfo(qrData, teacherData),
+    {
+      type: 'text',
+      text: MESSAGES.ASK_COMBINED_INPUT,
+      quickReply: {
+        items: [
+          {
+            type: 'action',
+            action: {
+              type:  'message',
+              label: '📭 ไม่มีงานมอบหมาย',
+              text:  '__NO_ASSIGNMENT__',
+            },
+          },
+          {
+            type: 'action',
+            action: {
+              type:        'postback',
+              label:       '❌ ยกเลิก',
+              data:        'action=cancel_checkin',
+              displayText: 'ยกเลิกการเช็คอิน',
+            },
+          },
+        ],
+      },
+    },
+  ]);
   // ────────────────────────────────────────────────────────
 }
 
@@ -1613,8 +1658,15 @@ function handleConfirmCheckin(userId, teacherData) {
   // ────────────────────────────────────────────────────────
 
   try {
-    // EDIT-K10: Flow ใหม่ไม่มี Checkout แล้ว — บันทึกทันทีเมื่อยืนยัน
-    const completedAt = new Date();
+    // บันทึกทันทีเมื่อยืนยัน พร้อม Checkout Time จำลองตามตารางสอนจริง
+    const completedAt    = new Date();
+    const checkinTimeObj = checkinData.checkinTime
+      ? new Date(checkinData.checkinTime)
+      : completedAt;
+
+    // คำนวณ Checkout Time และ Duration จากเวลาจบคาบจริงใน PERIODS
+    // เพื่อให้ข้อมูลใน Sheet สมบูรณ์สำหรับ Report และ Dashboard
+    const simulated = buildSimulatedCheckout(checkinData.timeEnd, checkinTimeObj);
 
     const success = saveCheckIn({
       teacherId:       checkinData.teacherId,
@@ -1632,9 +1684,9 @@ function handleConfirmCheckin(userId, teacherData) {
       assignment:      checkinData.assignment,
       qrToken:         checkinData.token,
       status:          checkinData.checkinStatus || SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME,
-      checkinTime:     checkinData.checkinTime ? new Date(checkinData.checkinTime) : completedAt,
-      checkoutTime:    completedAt,
-      durationMinutes: 0,
+      checkinTime:     checkinTimeObj,
+      checkoutTime:    simulated.checkoutTime,
+      durationMinutes: simulated.durationMinutes,
       checkoutStatus:  'Completed',
     });
 
@@ -1999,9 +2051,11 @@ function notifyMonitorAfterCheckin(checkinData, qrData) {
  */
 function notifyAdminAfterCheckin(checkinData, status) {
   try {
-    const icon  = status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
-    const label = status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? 'ตรงเวลา' : 'สาย';
-    const time  = new Date().toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+    const icon    = status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? '🟢' : '🟡';
+    const label   = status === SYSTEM_CONFIG.CHECKIN_STATUS.ON_TIME ? 'ตรงเวลา' : 'สาย';
+    // แสดงเวลาที่ครูสแกน QR จริง ไม่ใช่เวลาที่ระบบส่ง Notification
+    const timeObj = checkinData.checkinTime ? new Date(checkinData.checkinTime) : new Date();
+    const time    = timeObj.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
 
     const msg =
       `${icon} เช็คอินใหม่ — ${label}\n` +
@@ -4172,7 +4226,7 @@ function flexClassInfo(qrData, teacher) {
         type: 'box', layout: 'vertical', backgroundColor: FLEX_COLORS.SECONDARY, paddingAll: '16px',
         contents: [
           { type: 'text', text: '📲 สแกน QR สำเร็จ!', color: FLEX_COLORS.WHITE, size: 'md', weight: 'bold' },
-          { type: 'text', text: 'ตรวจสอบข้อมูล แล้วกดปุ่ม "เข้าสอน" ด้านล่างค่ะ', color: '#B0BEC5', size: 'xs', margin: 'xs' },
+          { type: 'text', text: 'ตรวจสอบข้อมูลให้ถูกต้อง แล้วพิมพ์เรื่องที่สอนได้เลยค่ะ', color: '#B0BEC5', size: 'xs', margin: 'xs' },
         ],
       },
       body: {
@@ -4187,20 +4241,11 @@ function flexClassInfo(qrData, teacher) {
         ],
       },
       footer: {
-        type: 'box', layout: 'horizontal', spacing: 'sm', paddingAll: '12px',
+        type: 'box', layout: 'vertical', paddingAll: '12px',
         contents: [
           {
-            type: 'button', style: 'secondary', height: 'sm', flex: 1,
-            action: { type: 'message', label: '❌ ยกเลิก', text: 'ยกเลิก' },
-          },
-          {
-            type: 'button', style: 'primary', color: FLEX_COLORS.PRIMARY, height: 'sm', flex: 2,
-            action: {
-              type: 'postback',
-              label: '✅ เข้าสอน',
-              data: 'action=confirm_teaching',
-              displayText: 'ยืนยันเข้าสอน',
-            },
+            type: 'button', style: 'secondary', height: 'sm',
+            action: { type: 'message', label: '❌ ยกเลิกการเช็คอิน', text: 'ยกเลิก' },
           },
         ],
       },
